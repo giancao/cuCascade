@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <kvikio/io/rest/s3/uri_encode.hpp>
+
 #include <chrono>
 #include <ctime>
 #include <string>
@@ -135,6 +137,6 @@ std::string sha256_hex(std::string_view data);
 
 /// RFC 3986 URI-encode @p s. If @p encode_slash is false, `/` passes through
 /// (used for path segments); if true, `/` becomes `%2F` (used for query components).
-std::string uri_encode(std::string_view s, bool encode_slash);
+using kvikio::io::rest::s3::uri_encode;
 
 }  // namespace cucascade::io::rest::s3

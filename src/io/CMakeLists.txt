@@ -17,13 +17,11 @@
 
 target_sources(
   cucascade_io_objects
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/uri_parser.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/engine_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/detail/local_descriptor.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/config.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/reactor_placement.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor.cpp
@@ -33,7 +31,6 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_reactor.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sigv4.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sigv4_authorizer.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/list_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/types.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp)
