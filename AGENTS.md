@@ -8,7 +8,7 @@ cache). Each library is built as `<name>_shared` and `<name>_static`, with stric
 | Library | Sources | Depends on |
 | --- | --- | --- |
 | `cucascade_cudf` (`CUCASCADE_BUILD_CUDF`) | `src/cudf`, `include/cucascade/cudf` | io (if enabled), core, libcudf |
-| `cucascade_io` (`CUCASCADE_BUILD_IO`) | `src/{io,exec}`, `include/cucascade/{io,exec}` | core, liburing, OpenSSL |
+| `cucascade_io` (`CUCASCADE_BUILD_IO`) | `src/{io,exec}`, `include/cucascade/{io,exec}` | core, liburing, OpenSSL, kvikIO (`CUCASCADE_USE_KVIKIO`) |
 | `cucascade` (core) | `src/{memory,data,cuda}`, `include/cucascade/{memory,data,cuda,utils,log}`, `include/cucascade/*.hpp` | topology, RMM, CUDA runtime |
 | `cucascade_topology_discovery` | `src/memory/topology_discovery.cpp`, `src/log` | NVML; never a link-time `libcuda` dependency |
 
@@ -39,6 +39,11 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   configured it, and the `build`/`test` tasks always use `build/release`, so give other envs their
   own dir: `pixi run -e cuda-13-stable bash -c "cmake --preset release -B build/cuda-13-stable &&
   cmake --build build/cuda-13-stable"`.
+- kvikIO is the `kvikio` git submodule (`git submodule update --init kvikio`), built from source
+  as `libkvikio.so` when `CUCASCADE_USE_KVIKIO` is ON (the default). Configure fails unless it is
+  the same RAPIDS release as libcudf. The submodule is on 26.10, so use a `*-stable` env; the
+  nightly envs, `default` included, need `-DCUCASCADE_USE_KVIKIO=OFF`. To build another checkout,
+  set `CUCASCADE_KVIKIO_SOURCE_DIR`; set it to an empty string to link an installed kvikIO.
 
 ## Before you finish
 
@@ -79,6 +84,14 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   types out of it, use the `cucascade::io::concurrent_queue` aliases instead of `moodycamel::`,
   and use only the parts of `exec::invocable` that `absl::AnyInvocable` also supports
   (`CUCASCADE_USE_ABSEIL_INVOCABLE`).
+- libcudf loads `libkvikio.so` too, and a process maps one library per soname, so the kvikIO built
+  here also serves libcudf; the environment's own copy must not be the one loaded. cuCascade puts
+  its build directory first in the runtime search path of its binaries and makes `libkvikio.so` a
+  direct dependency of everything linking the io library; the `[kvikio]` test fails if another
+  copy is loaded. A host linking cuCascade statically inherits the direct dependency but has to
+  order the search path of its own binaries itself, with `CUCASCADE_KVIKIO_LIBRARY_DIR`. It also
+  has to add cuCascade before any package whose CMake config imports kvikIO (libcuvs does), or
+  configure fails; later `find_package(kvikio)` calls are served by this build.
 
 ## Invariants that are easy to break
 
