@@ -135,6 +135,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   # Tests of the io_uring REST transport modules.
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/tls/tests.cmake)
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/http/tests.cmake)
+  if(CUCASCADE_USE_KVIKIO)
+    target_sources(cucascade_io_tests PRIVATE io/test_kvikio_dependency.cpp)
+    target_compile_definitions(
+      cucascade_io_tests
+      PRIVATE CUCASCADE_TEST_KVIKIO_LIBRARY="$<TARGET_FILE:kvikio::kvikio>")
+  endif()
   # Tests of src-private helpers (io/detail/..., the transport modules) include
   # them from src/.
   target_include_directories(cucascade_io_tests
@@ -196,6 +202,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
               cudf/test_dispose_eviction.cpp
               cudf/test_explicit_eviction.cpp
               cudf/test_write_cache_invalidation.cpp)
+    if(CUCASCADE_USE_KVIKIO)
+      target_sources(cucascade_cudf_tests PRIVATE io/test_kvikio_dependency.cpp)
+      target_compile_definitions(
+        cucascade_cudf_tests
+        PRIVATE CUCASCADE_TEST_KVIKIO_LIBRARY="$<TARGET_FILE:kvikio::kvikio>")
+    endif()
   endif()
 
   set_target_properties(cucascade_cudf_tests
