@@ -116,6 +116,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/s3/test_static_credentials.cpp
     io/rest/net/test_net_dns.cpp
     io/rest/net/test_net_transport.cpp
+    io/uring/test_uring_allocations.cpp
     io/uring/test_uring_readv.cpp
     io/uring/test_uring_write.cpp
     # Utils
