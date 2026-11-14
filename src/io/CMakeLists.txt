@@ -19,6 +19,7 @@ target_sources(
   cucascade_io_objects
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/uri_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/engine_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/detail/local_descriptor.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/config.cpp
