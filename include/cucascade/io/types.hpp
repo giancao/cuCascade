@@ -56,20 +56,8 @@ class ioctx;
 
 namespace cucascade::io {
 
-inline constexpr std::size_t IO_BLOCK_SIZE = 4096;
-
-/// The granule writes are split at: @c max(IO_BLOCK_SIZE, page size).  The
-/// aligned body of a write goes O_DIRECT and its unaligned head / tail through
-/// the page cache; splitting at a page boundary keeps the two from ever sharing
-/// a page (64 KiB pages on some aarch64 systems).
-[[nodiscard]] inline std::size_t write_granule() noexcept
-{
-  static std::size_t const granule = [] {
-    auto const page = ::sysconf(_SC_PAGESIZE);
-    return page > 0 ? std::max(IO_BLOCK_SIZE, static_cast<std::size_t>(page)) : IO_BLOCK_SIZE;
-  }();
-  return granule;
-}
+using kvikio::io::IO_BLOCK_SIZE;
+using kvikio::io::write_granule;
 
 /**
  * @brief RAII wrapper for a POSIX file descriptor.

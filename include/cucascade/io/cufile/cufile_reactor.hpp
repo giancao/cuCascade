@@ -507,7 +507,8 @@ class cufile_reactor {
 
 }  // namespace cucascade::io::cufile
 
-namespace cucascade::io {
+// The traits template is kvikIO's, so it is specialized in its namespace.
+namespace kvikio::io::detail {
 
 /// The reactor serves contiguous host destinations (POSIX pread), contiguous
 /// device destinations (cuFileRead) and a caller-supplied contiguous
@@ -520,7 +521,7 @@ namespace cucascade::io {
 /// fragmented cache-chunk host buffer, which this reactor rejects.  Both flags
 /// false keeps the cache from ever being armed here.
 template <>
-struct reactor_traits<cufile::cufile_reactor> {
+struct reactor_traits<cucascade::io::cufile::cufile_reactor> {
   static constexpr bool supports_device_read         = true;
   static constexpr bool supports_host_to_device_read = false;
   static constexpr bool supports_vector_host_read    = false;
@@ -528,4 +529,4 @@ struct reactor_traits<cufile::cufile_reactor> {
   static constexpr bool prefers_bulk_io              = false;
 };
 
-}  // namespace cucascade::io
+}  // namespace kvikio::io::detail

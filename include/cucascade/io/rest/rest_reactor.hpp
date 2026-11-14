@@ -619,16 +619,17 @@ class rest_reactor {
 
 }  // namespace cucascade::io::rest
 
-namespace cucascade::io {
+// The traits template is kvikIO's, so it is specialized in its namespace.
+namespace kvikio::io::detail {
 
 /// The REST reactor declares write stubs only (see @c rest_reactor): it
 /// advertises no writes, so @c templated_ioctx<rest::rest_reactor> reports
 /// @c supports_write() == @c supports_device_write() == false.  Declared here,
 /// next to the reactor, so it precedes every instantiation of the context.
 template <>
-struct reactor_write_traits<rest::rest_reactor> {
+struct reactor_write_traits<cucascade::io::rest::rest_reactor> {
   static constexpr bool supports_write        = false;
   static constexpr bool supports_device_write = false;
 };
 
-}  // namespace cucascade::io
+}  // namespace kvikio::io::detail
