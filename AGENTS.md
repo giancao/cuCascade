@@ -42,9 +42,17 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   cmake --build build/cuda-13-stable"`.
 - kvikIO is the `kvikio` git submodule (`git submodule update --init kvikio`), built from source
   as `libkvikio.so` when `CUCASCADE_USE_KVIKIO` is ON (the default). Configure fails unless it is
-  the same RAPIDS release as libcudf. The submodule is on 26.10, so use a `*-stable` env; the
-  nightly envs, `default` included, need `-DCUCASCADE_USE_KVIKIO=OFF`. To build another checkout,
-  set `CUCASCADE_KVIKIO_SOURCE_DIR`; set it to an empty string to link an installed kvikIO.
+  the same RAPIDS release as libcudf. The submodule is on 26.10, so use a `*-stable` env. The io
+  library requires kvikIO (`CUCASCADE_BUILD_IO=ON` with `CUCASCADE_USE_KVIKIO=OFF` fails at
+  configure), so the nightly envs, `default` included, can only build with
+  `-DCUCASCADE_BUILD_IO=OFF -DCUCASCADE_USE_KVIKIO=OFF`. To build another checkout, set
+  `CUCASCADE_KVIKIO_SOURCE_DIR`; set it to an empty string to link an installed kvikIO, which
+  must be the POC fork (upstream kvikIO lacks the `kvikio/exec` and `kvikio/io` headers).
+- `cucascade::exec::{semi_future,promise,future,try_t,invocable}`, `cucascade::io::byte_range` and
+  `cucascade::io::object_identity` are re-exports of the kvikIO types of the same name
+  (`kvikio/exec/`, `kvikio/io/`). Change them in the kvikIO submodule, not here.
+  `CUCASCADE_USE_ABSEIL_INVOCABLE` is passed on to the kvikIO build as
+  `KvikIO_USE_ABSEIL_INVOCABLE`; the two must agree.
 
 ## Before you finish
 

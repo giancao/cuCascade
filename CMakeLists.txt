@@ -156,6 +156,15 @@ if(CUCASCADE_USE_KVIKIO AND NOT CUCASCADE_BUILD_IO)
       CACHE BOOL "Link the cucascade-io library against kvikIO" FORCE)
 endif()
 
+# The io library is built on kvikIO: its future/promise types, byte ranges and
+# object identities are kvikIO's, and the I/O engines are moving there.
+if(CUCASCADE_BUILD_IO AND NOT CUCASCADE_USE_KVIKIO)
+  message(
+    FATAL_ERROR
+      "CUCASCADE_BUILD_IO=ON requires CUCASCADE_USE_KVIKIO=ON: cucascade-io uses kvikIO's exec and io headers. Enable CUCASCADE_USE_KVIKIO, or set CUCASCADE_BUILD_IO=OFF."
+  )
+endif()
+
 function(cucascade_add_kvikio)
   if(NOT CUCASCADE_KVIKIO_SOURCE_DIR)
     if(NOT TARGET kvikio::kvikio)
@@ -196,6 +205,12 @@ function(cucascade_add_kvikio)
 
   set(BUILD_SHARED_LIBS ON)
   set(KvikIO_REMOTE_SUPPORT ON)
+  # cucascade::exec::invocable is kvikio::exec::invocable, so kvikIO is built
+  # with the same backend as cuCascade and its host.
+  set(KvikIO_USE_ABSEIL_INVOCABLE ${CUCASCADE_USE_ABSEIL_INVOCABLE})
+  if(CUCASCADE_USE_ABSEIL_INVOCABLE)
+    set(KvikIO_ABSEIL_INVOCABLE_TARGET ${_cucascade_absl_target})
+  endif()
   set(KvikIO_BUILD_BENCHMARKS OFF)
   set(KvikIO_BUILD_EXAMPLES OFF)
   set(KvikIO_BUILD_NSYS_PLUGIN OFF)

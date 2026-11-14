@@ -18,34 +18,18 @@
 
 #pragma once
 
-#include <cstdint>
+/**
+ * @file byte_range.hpp
+ * @brief A half-open byte range [offset, offset + size) within a file/object.
+ *
+ * The type lives in kvikIO (`kvikio/io/byte_range.hpp`); this header re-exports
+ * it in `cucascade::io`.
+ */
+
+#include <kvikio/io/byte_range.hpp>
 
 namespace cucascade::io {
 
-/**
- * @brief A half-open byte range [offset, offset + size) within a file/object.
- *
- * cudf-free equivalent of @c cudf::io::text::byte_range_info, so the io core
- * can express range-based APIs (fadvise ranges, alignment/coalescing) without
- * depending on cudf.  The cudf-coupled datasource layer converts to/from the
- * cudf type at its boundary.
- */
-class byte_range {
- public:
-  byte_range() = default;
-
-  constexpr byte_range(std::int64_t offset, std::int64_t size) noexcept
-    : _offset(offset), _size(size)
-  {
-  }
-
-  [[nodiscard]] constexpr std::int64_t offset() const noexcept { return _offset; }
-  [[nodiscard]] constexpr std::int64_t size() const noexcept { return _size; }
-  [[nodiscard]] constexpr bool is_empty() const noexcept { return _size == 0; }
-
- private:
-  std::int64_t _offset{0};
-  std::int64_t _size{0};
-};
+using kvikio::io::byte_range;
 
 }  // namespace cucascade::io
