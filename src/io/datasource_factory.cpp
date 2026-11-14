@@ -45,6 +45,9 @@ namespace cucascade::io {
 
 namespace {
 
+/// Unified IO POC: NUMA-aware reactor placement (upstream PR #224) is not merged
+/// into this branch, so every reactor stages from the first HOST space.
+///
 /// First HOST-tier pinned staging resource, or nullptr when none exists.  The
 /// uring / rest reactors stage device reads through it and size their bounce
 /// slots from its block size.
