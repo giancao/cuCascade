@@ -99,6 +99,8 @@ class pool_peer_access_result {
  * Memory tier enumeration representing different types of memory storage.
  * Ordered roughly by performance (fastest to slowest access).
  */
+// Unified IO POC: the REMOTE object-store tier (upstream PR #222) is not merged
+// into this branch.
 enum class Tier : int32_t {
   GPU,   // GPU device memory (fastest but limited)
   HOST,  // Host system memory (fast, larger capacity)

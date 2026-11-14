@@ -177,6 +177,9 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
 
   // -- Writes: not yet implemented ------------------------------------------
   //
+  // Unified IO POC: upstream PR #221 (S3 PUT / multipart upload) is not merged
+  // into this branch.  Take it when S3 writes are needed.
+  //
   // REST writes (S3 PUT / multipart upload) are not implemented yet.  Every
   // write and flush hook reports @c not_implemented_error
   // (@c std::errc::not_supported) without touching the network: the

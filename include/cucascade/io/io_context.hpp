@@ -360,6 +360,9 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
 
   // -- Writes -------------------------------------------------------------------
   //
+  // Unified IO POC: object deletion (ioctx::remove_io_object, upstream PR #222) is
+  // not merged into this branch, so there is no delete entry point here.
+  //
   // The write entry points callers should use.  They validate, drop everything
   // the prefetching cache and the metadata store hold for the object's path
   // (again once the write settled, before the future resolves, so a prefetch
