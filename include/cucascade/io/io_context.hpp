@@ -37,7 +37,9 @@
 
 namespace cucascade::io {
 
-enum class io_context_type { uring, restful, s3rdma, cufile };
+/// What serves an io context. @c cufile_posix is kvikIO's built-in engine for
+/// local files (cuFile where available, POSIX otherwise), behind @c engine_ioctx.
+enum class io_context_type { uring, restful, s3rdma, cufile, cufile_posix };
 
 // open_hint (generic, parquet_footer_probe) is kvikIO's; see cucascade/io/types.hpp.
 

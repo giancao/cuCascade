@@ -20,12 +20,18 @@
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #endif
 #include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/engine_ioctx.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+#include <kvikio/io/engine_registry.hpp>
+
 #include <catch2/catch_all.hpp>
 
+#include <array>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -186,6 +192,48 @@ namespace {
 }
 
 }  // namespace
+
+TEST_CASE("cufile_posix routing takes local regular files only", "[io][registry][cufile_posix]")
+{
+  registry_fixture fixture{config_for(io_backend::cufile_posix)};
+  // Repeated lookups never depend on the registry's iteration order.
+  for (int i = 0; i < 8; ++i) {
+    CHECK(fixture.registry.lookup_path("/proc/self/exe") == io_context_type::cufile_posix);
+  }
+  CHECK(fixture.registry.lookup_path("s3://bucket/key") == io_context_type::restful);
+  CHECK_FALSE(fixture.registry.lookup_path("/tmp").has_value());
+}
+
+TEST_CASE("the cufile_posix context is served by kvikIO's built-in engine",
+          "[io][registry][cufile_posix]")
+{
+  registry_fixture fixture{config_for(io_backend::cufile_posix)};
+  auto context = fixture.registry.make_ioctx(io_context_type::cufile_posix);
+  REQUIRE(context != nullptr);
+  CHECK(context->type() == io_context_type::cufile_posix);
+
+  auto* front = dynamic_cast<cucascade::io::engine_ioctx*>(context.get());
+  REQUIRE(front != nullptr);
+  CHECK(front->engine().name() == "cufile_posix");
+  // The engine cuCascade uses is the one selected in kvikIO for local files.
+  CHECK(kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local) ==
+        "cufile_posix");
+
+  // It can feed the prefetching cache, and says it has no request priorities.
+  CHECK(context->can_use_fs_cache());
+  CHECK(context->supports_write());
+  CHECK_FALSE(front->engine().capabilities().priority);
+
+  // A read through the front end returns the file's bytes.
+  auto object = context->open_io_object("/proc/self/exe");
+  REQUIRE(object->size() > 4);
+  std::array<std::uint8_t, 4> magic{};
+  auto future = context->host_read_async_io(*object, 0, magic.size(), magic.data());
+  CHECK(std::move(future).get(std::chrono::seconds{30}) == magic.size());
+  CHECK(magic == std::array<std::uint8_t, 4>{0x7f, 'E', 'L', 'F'});
+
+  context->shutdown();
+}
 
 #ifdef CUCASCADE_HAS_CUFILE
 TEST_CASE("cufile routing takes local regular files only", "[io][registry][cufile]")

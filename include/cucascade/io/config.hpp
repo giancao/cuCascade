@@ -40,6 +40,12 @@ enum class io_backend {
   /// (@c CUCASCADE_HAS_CUFILE); without it no cuFile backend is registered and
   /// local paths resolve to nothing rather than to another backend.
   cufile,
+  /// kvikIO's built-in engine for local files: cuFile where the system supports
+  /// it, POSIX otherwise.  It needs neither io_uring nor a plugin, so it is the
+  /// engine to use where the native stack cannot run.  It works with the
+  /// prefetching cache, but has no request priorities.  @c s3:// URLs still go
+  /// to the REST backend.
+  cufile_posix,
 };
 
 /**
@@ -81,6 +87,9 @@ struct io_config {
   /// Local (uring) reactor configuration.  @c use_odirect is derived from
   /// @ref cache; physical operation size is selected by the worker.
   uring::config uring{};
+
+  /// Worker threads of the @ref io_backend::cufile_posix engine.
+  std::size_t cufile_posix_n_threads{8};
 
   /// REST (S3/object-store) reactor configuration — timeouts, TLS, logical
   /// merge hints, retry policy, and connection limits.  Physical GET sizing is
