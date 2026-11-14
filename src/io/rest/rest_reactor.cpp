@@ -240,13 +240,11 @@ std::vector<range> physical_ranges(prepared_io_slice const& slice,
   auto const max_segment_bytes = std::max(cfg.max_segment_bytes, cache_block_size);
   std::vector<range> result;
   range current{};
-  for (auto* chunk : slice.h_buffer.fragments()) {
-    if (chunk == nullptr || chunk->data == nullptr) {
+  for (auto const& fragment : slice.h_buffer.fragments()) {
+    if (fragment.data == nullptr) {
       throw std::runtime_error("rest_reactor: fragmented read has no cache buffer");
     }
-    auto const [fill_lo, fill_hi] =
-      cache::fill_span(chunk->state.get_fill(), chunk->offset, cache_block_size);
-    auto const fill = range{fill_lo, fill_hi - fill_lo};
+    auto const fill = fragment.rng();
     if (fill.empty()) { continue; }
     if (fill.size > max_segment_bytes) {
       throw std::runtime_error("rest_reactor: one cache fill exceeds the REST segment maximum");
@@ -269,9 +267,7 @@ std::vector<range> physical_ranges(prepared_io_slice const& slice,
   return result;
 }
 
-std::vector<iovec> operation_iovecs(prepared_io_slice const& slice,
-                                    range io_rng,
-                                    std::size_t cache_block_size)
+std::vector<iovec> operation_iovecs(prepared_io_slice const& slice, range io_rng)
 {
   std::vector<iovec> result;
   if (slice.is_contiguous()) {
@@ -282,12 +278,10 @@ std::vector<iovec> operation_iovecs(prepared_io_slice const& slice,
   if (slice.needs_staging()) { return result; }
 
   std::size_t covered = 0;
-  for (auto* chunk : slice.h_buffer.fragments()) {
-    auto const [fill_lo, fill_hi] =
-      cache::fill_span(chunk->state.get_fill(), chunk->offset, cache_block_size);
-    auto const overlap = intersect(io_rng, range{fill_lo, fill_hi - fill_lo});
+  for (auto const& fragment : slice.h_buffer.fragments()) {
+    auto const overlap = intersect(io_rng, fragment.rng());
     if (overlap.empty()) { continue; }
-    result.push_back(iovec{chunk->data + (overlap.offset - chunk->offset), overlap.size});
+    result.push_back(iovec{fragment.data + (overlap.offset - fragment.offset), overlap.size});
     covered += overlap.size;
   }
   if (covered != io_rng.size) {
@@ -296,16 +290,12 @@ std::vector<iovec> operation_iovecs(prepared_io_slice const& slice,
   return result;
 }
 
-std::vector<cache::cached_chunk*> operation_chunks(prepared_io_slice const& slice,
-                                                   range io_rng,
-                                                   std::size_t cache_block_size)
+std::vector<fragment_handle> operation_handles(prepared_io_slice const& slice, range io_rng)
 {
-  std::vector<cache::cached_chunk*> result;
+  std::vector<fragment_handle> result;
   if (!slice.is_fragmented()) { return result; }
-  for (auto* chunk : slice.h_buffer.fragments()) {
-    auto const [fill_lo, fill_hi] =
-      cache::fill_span(chunk->state.get_fill(), chunk->offset, cache_block_size);
-    if (!intersect(io_rng, range{fill_lo, fill_hi - fill_lo}).empty()) { result.push_back(chunk); }
+  for (auto const& fragment : slice.h_buffer.fragments()) {
+    if (!intersect(io_rng, fragment.rng()).empty()) { result.push_back(fragment.handle); }
   }
   return result;
 }
@@ -1061,7 +1051,9 @@ void reactor_worker::expand_active(std::size_t free_connections)
         auto* dst = std::get<std::uint8_t*>(slice.h_buffer.buffer);
         std::memcpy(dst, stash->data() + (slice.rng.offset - lo), slice.rng.size);
         _r._queued_bytes.fetch_sub(slice_size, std::memory_order_relaxed);
-        if (slice.on_complete != nullptr) { (*slice.on_complete)({}, true); }
+        if (slice.on_complete != nullptr) {
+          (*slice.on_complete)(std::span<fragment_handle const>{}, true);
+        }
         _active->coordinator->on_complete();
         if (_active->empty()) { _active.reset(); }
         return;
@@ -1083,20 +1075,20 @@ void reactor_worker::expand_active(std::size_t free_connections)
     expanded.reserve(ranges.size());
     std::size_t logical_bytes = 0;
     for (auto const io_rng : ranges) {
-      auto op               = std::make_unique<io_op_request>();
-      op->obj               = _active->obj;
-      op->io_rng            = io_rng;
-      op->iovecs            = operation_iovecs(slice, io_rng, block_size);
-      op->coordinator       = _active->coordinator;
-      op->on_complete       = slice.on_complete;
-      op->completion_chunks = operation_chunks(slice, io_rng, block_size);
+      auto op                = std::make_unique<io_op_request>();
+      op->obj                = _active->obj;
+      op->io_rng             = io_rng;
+      op->iovecs             = operation_iovecs(slice, io_rng);
+      op->coordinator        = _active->coordinator;
+      op->on_complete        = slice.on_complete;
+      op->completion_handles = operation_handles(slice, io_rng);
       if (slice.has_device_request()) {
         op->device_copy = std::make_unique<device_cpy_request>(
           device_cpy_request{slice.rng, slice.d_buffer, slice.d_buffer.device_id});
         // A null stream handle means the legacy default stream to the caller; on this thread
         // it could mean the per-thread one, so name it explicitly.
-        if (op->device_copy->d_buffer.stream.get() == nullptr) {
-          op->device_copy->d_buffer.stream = ::cuda::stream_ref{cudaStreamLegacy};
+        if (op->device_copy->d_buffer.stream == nullptr) {
+          op->device_copy->d_buffer.stream = cudaStreamLegacy;
         }
       }
       auto request           = std::make_unique<data_op>();
@@ -1814,7 +1806,7 @@ bool reactor_worker::start_copy(std::size_t index)
     // Part of the batch may be queued already: let it finish reading the staging first.
     try {
       rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
-      std::ignore = cudaStreamSynchronize(copy.d_buffer.stream.get());
+      std::ignore = cudaStreamSynchronize(copy.d_buffer.stream);
     } catch (...) {  // NOLINT(bugprone-empty-catch): best effort; the copy already failed
     }
     recycle_event(device, std::move(event));

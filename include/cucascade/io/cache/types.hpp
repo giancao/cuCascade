@@ -1017,6 +1017,45 @@ inline void publish_chunk_fill(std::span<cached_chunk* const> completed, bool ho
   }
 }
 
+/// The chunk a fragment built by @ref make_fragment stands for.
+[[nodiscard]] inline cached_chunk* chunk_of(io::fragment_handle handle) noexcept
+{
+  return static_cast<cached_chunk*>(handle);
+}
+
+/// The fragment an io backend fills for @p chunk, whose claimed extent is
+/// @p fill (the value the claiming CAS returned). A claimed chunk's extent no
+/// longer changes, so the fragment's range is fixed for the whole read. The
+/// chunk itself is the handle the backend hands back.
+[[nodiscard]] inline io::fragment make_fragment(cached_chunk* chunk,
+                                                chunk_fill fill,
+                                                std::size_t chunk_bytes) noexcept
+{
+  auto const [lo, hi] = fill_span(fill, chunk->offset, chunk_bytes);
+  return io::fragment{
+    lo, chunk->data == nullptr ? nullptr : chunk->data + (lo - chunk->offset), hi - lo, chunk};
+}
+
+/// @ref make_fragment as a one-fragment host buffer.
+[[nodiscard]] inline io::host_buffer make_fragment_buffer(cached_chunk* chunk,
+                                                          chunk_fill fill,
+                                                          std::size_t chunk_bytes)
+{
+  std::vector<io::fragment> fragments;
+  fragments.push_back(make_fragment(chunk, fill, chunk_bytes));
+  return io::host_buffer{std::move(fragments)};
+}
+
+/// @ref publish_chunk_fill for the handles a backend handed back.
+inline void publish_chunk_fill(std::span<io::fragment_handle const> completed,
+                               bool host_ok) noexcept
+{
+  for (auto* handle : completed) {
+    auto* chunk = chunk_of(handle);
+    std::ignore = host_ok ? chunk->state.mark_cached() : chunk->state.mark_load_failed();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // chunk_arena — append-only, pointer-stable storage for cached_chunk
 // ---------------------------------------------------------------------------

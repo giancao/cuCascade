@@ -260,7 +260,7 @@ class worker_plug {
   [[nodiscard]] std::shared_ptr<prepared_io_completion> completion() const
   {
     return std::make_shared<prepared_io_completion>(
-      [state = _state](std::span<cached_chunk* const>, bool) noexcept {
+      [state = _state](std::span<cucascade::io::fragment_handle const>, bool) noexcept {
         state->entered.fetch_add(1);
         auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         while (!state->released.load() && std::chrono::steady_clock::now() < deadline) {
@@ -480,17 +480,17 @@ TEST_CASE("io_uring cache callback precedes its coordinator credit", "[io][uring
   bool callback_success      = false;
   cached_chunk* observed     = nullptr;
   auto completion            = std::make_shared<prepared_io_completion>(
-    [&](std::span<cached_chunk* const> chunks, bool success) noexcept {
+    [&](std::span<cucascade::io::fragment_handle const> chunks, bool success) noexcept {
       ++callback_count;
       credits_seen     = coordinator->tasks_remaining();
       callback_success = success;
-      if (chunks.size() == 1) observed = chunks.front();
+      if (chunks.size() == 1) observed = cucascade::io::cache::chunk_of(chunks.front());
     });
 
   auto op                 = std::make_unique<uring_io_op>();
   op->request.coordinator = coordinator;
   op->request.on_complete = completion;
-  op->request.completion_chunks.push_back(&chunk);
+  op->request.completion_handles.push_back(&chunk);
 
   op->request.finish_success();
   op->request.finish_success();
@@ -515,11 +515,11 @@ TEST_CASE("io_uring physical expansion publishes cache fragments independently",
   bool callbacks_valid        = true;
 
   auto completion = std::make_shared<prepared_io_completion>(
-    [&](std::span<cached_chunk* const> chunks, bool success) noexcept {
+    [&](std::span<cucascade::io::fragment_handle const> chunks, bool success) noexcept {
       callbacks_valid =
         callbacks_valid && success && chunks.size() == 1 && published_count < published.size();
       if (chunks.size() == 1 && published_count < published.size()) {
-        published[published_count++] = chunks.front();
+        published[published_count++] = cucascade::io::cache::chunk_of(chunks.front());
       }
     });
 
@@ -527,7 +527,7 @@ TEST_CASE("io_uring physical expansion publishes cache fragments independently",
     auto op                 = std::make_unique<uring_io_op>();
     op->request.coordinator = coordinator;
     op->request.on_complete = completion;
-    op->request.completion_chunks.push_back(chunk);
+    op->request.completion_handles.push_back(chunk);
     return op;
   };
 
@@ -552,8 +552,9 @@ TEST_CASE("io_uring CUDA-stage failure may publish valid host data before error"
   auto future      = coordinator->get_future();
   bool host_valid  = false;
 
-  auto completion = std::make_shared<prepared_io_completion>(
-    [&](std::span<cached_chunk* const>, bool success) noexcept { host_valid = success; });
+  auto completion =
+    std::make_shared<prepared_io_completion>([&](std::span<cucascade::io::fragment_handle const>,
+                                                 bool success) noexcept { host_valid = success; });
 
   auto op                 = std::make_unique<uring_io_op>();
   op->request.coordinator = coordinator;
@@ -720,7 +721,7 @@ TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[io][uring
       };
 
       auto reenter = std::make_shared<prepared_io_completion>(
-        [&](std::span<cached_chunk* const>, bool) noexcept {
+        [&](std::span<cucascade::io::fragment_handle const>, bool) noexcept {
           *inner_canceled = canceled(submit(nullptr));
         });
 

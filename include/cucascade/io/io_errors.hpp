@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <kvikio/io/errors.hpp>
+
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -105,14 +107,6 @@ class object_changed_error : public std::runtime_error {
  * @c std::system_error and compare its code keep working; the message names
  * the backend and operation and says "not yet implemented".
  */
-class not_implemented_error : public std::system_error {
- public:
-  /// @p what names the backend and the operation, e.g. "rest: host_write".
-  explicit not_implemented_error(std::string const& what)
-    : std::system_error(std::make_error_code(std::errc::not_supported),
-                        what + ": not yet implemented")
-  {
-  }
-};
+using kvikio::io::not_implemented_error;
 
 }  // namespace cucascade::io

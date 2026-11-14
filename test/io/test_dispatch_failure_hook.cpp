@@ -176,9 +176,8 @@ std::vector<cucascade::io::prepared_io_slice> device_slices(stub_io_object const
                                                             std::uint8_t* destination)
 {
   std::vector<cucascade::io::prepared_io_slice> slices;
-  slices.emplace_back(
-    cucascade::io::range{0, object.size()},
-    cucascade::io::device_buffer{destination, ::cuda::stream_ref{cudaStream_t{nullptr}}});
+  slices.emplace_back(cucascade::io::range{0, object.size()},
+                      cucascade::io::device_buffer{destination, cudaStream_t{nullptr}});
   return slices;
 }
 
@@ -220,9 +219,8 @@ TEST_CASE("a mixed host and device dispatch failure fires the hook once", "[io][
   auto object               = make_object(controls);
   std::uint8_t byte{};
   auto slices = host_slices(*object, &byte);
-  slices.emplace_back(
-    cucascade::io::range{0, object->size()},
-    cucascade::io::device_buffer{&byte, ::cuda::stream_ref{cudaStream_t{nullptr}}});
+  slices.emplace_back(cucascade::io::range{0, object->size()},
+                      cucascade::io::device_buffer{&byte, cudaStream_t{nullptr}});
   hooked_ioctx ioctx;
 
   auto future = ioctx.mixed_readv_async_io(*object, std::move(slices));

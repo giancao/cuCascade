@@ -1127,7 +1127,7 @@ bool cufile_reactor::park_if_stream_busy(std::shared_ptr<const io_object> const&
   if (device_id < 0) { CUCASCADE_CUDA_TRY(cudaGetDevice(&device_id)); }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
 
-  auto const stream = slice.d_buffer.stream.get();
+  auto const stream = slice.d_buffer.stream;
   if (stream != cudaStreamLegacy) {
     auto const state = cudaStreamQuery(stream);
     if (state == cudaSuccess) return false;
@@ -1285,13 +1285,13 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
   cucascade::cuda::cuda_event event{cudaEventDisableTiming};
   auto status = request->device_copy->copy_async(request->io_rng, request->iovecs);
-  if (status == cudaSuccess) status = record_copy_event(event.get(), slice.d_buffer.stream.get());
+  if (status == cudaSuccess) status = record_copy_event(event.get(), slice.d_buffer.stream);
   if (status != cudaSuccess) {
     // Some copies may already be queued on the caller's stream (copy_async can
     // fail part-way, or only the event record failed): they still read the host
     // buffer and write the destination, so wait for them before settling, or
     // the caller could free either while the DMA runs.
-    std::ignore = cudaStreamSynchronize(slice.d_buffer.stream.get());
+    std::ignore = cudaStreamSynchronize(slice.d_buffer.stream);
     std::ignore = cudaGetLastError();
     request->finish_error(status, /*host_data_valid=*/true);
     return;
