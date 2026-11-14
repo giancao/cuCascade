@@ -559,7 +559,7 @@ TEST_CASE("io_uring CUDA-stage failure may publish valid host data before error"
   auto op                 = std::make_unique<uring_io_op>();
   op->request.coordinator = coordinator;
   op->request.on_complete = completion;
-  op->request.finish_error(cudaErrorInvalidValue, true);
+  op->request.finish_error(CUDA_ERROR_INVALID_VALUE, true);
 
   CHECK(host_valid);
   CHECK_THROWS(std::move(future).get());

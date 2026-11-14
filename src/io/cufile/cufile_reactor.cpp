@@ -1278,13 +1278,14 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
   int device_id = slice.d_buffer.device_id;
   if (device_id < 0) {
     if (auto const status = cudaGetDevice(&device_id); status != cudaSuccess) {
-      request->finish_error(status, /*host_data_valid=*/true);
+      request->finish_error(to_driver_status(status), /*host_data_valid=*/true);
       return;
     }
   }
   rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
   cucascade::cuda::cuda_event event{cudaEventDisableTiming};
-  auto status = request->device_copy->copy_async(request->io_rng, request->iovecs);
+  auto status =
+    to_runtime_status(request->device_copy->copy_async(request->io_rng, request->iovecs));
   if (status == cudaSuccess) status = record_copy_event(event.get(), slice.d_buffer.stream);
   if (status != cudaSuccess) {
     // Some copies may already be queued on the caller's stream (copy_async can
@@ -1293,7 +1294,7 @@ void cufile_reactor::dispatch_posix(cufile_io_object const& file,
     // the caller could free either while the DMA runs.
     std::ignore = cudaStreamSynchronize(slice.d_buffer.stream);
     std::ignore = cudaGetLastError();
-    request->finish_error(status, /*host_data_valid=*/true);
+    request->finish_error(to_driver_status(status), /*host_data_valid=*/true);
     return;
   }
   _inflight_copy.push_back(inflight_copy{std::move(request), std::move(event), bytes_read});
@@ -1385,7 +1386,7 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
       pending[slot] = false;
       if (auto const status = copied[slot].synchronize_no_throw(); status != cudaSuccess) {
         std::ignore = drain();
-        request.finish_error(status);
+        request.finish_error(to_driver_status(status));
         return;
       }
     }
@@ -1418,14 +1419,14 @@ void cufile_reactor::read_device_staged(cufile_io_object const& file,
       std::ignore = cudaStreamSynchronize(stream);
       std::ignore = cudaGetLastError();
       std::ignore = drain();
-      request.finish_error(status);
+      request.finish_error(to_driver_status(status));
       return;
     }
     pending[slot] = true;
     done += want;
   }
   if (auto const status = drain(); status != cudaSuccess) {
-    request.finish_error(status);
+    request.finish_error(to_driver_status(status));
     return;
   }
   request.finish_success();
@@ -1782,7 +1783,7 @@ void cufile_reactor::poll_completions() noexcept
         dispatch_slice(waiting.obj, std::move(waiting.slice), waiting.coordinator, true);
         continue;
       }
-      if (status != cudaSuccess) error = status;
+      if (status != cudaSuccess) error = to_driver_status(status);
       if (waiting.slice.on_complete != nullptr) {
         (*waiting.slice.on_complete)(waiting.slice.h_buffer.fragments(), false);
       }
@@ -1802,7 +1803,7 @@ void cufile_reactor::poll_completions() noexcept
     if (status == cudaSuccess) {
       it->request->finish_success();
     } else {
-      it->request->finish_error(status, /*host_data_valid=*/true);
+      it->request->finish_error(to_driver_status(status), /*host_data_valid=*/true);
     }
   }
   _inflight_copy.erase(copy_out, _inflight_copy.end());
