@@ -197,7 +197,8 @@ exec::semi_future<size_t> ioctx::host_read_async_io(
   if (size == 0) return exec::make_semi_future<size_t>(0);
   try {
     if (dst == nullptr) throw std::invalid_argument("host read destination is null");
-    std::vector<prepared_io_slice> slices{prepared_io_slice{range{offset, size}, host_buffer{dst}}};
+    std::vector<prepared_io_slice> slices;
+    slices.emplace_back(range{offset, size}, host_buffer{dst});
     slices.front().priority = resolve_priority(priority, io_priority::high);
     return host_device_readv_async_io(obj, std::move(slices));
   } catch (...) {
@@ -215,8 +216,8 @@ exec::semi_future<size_t> ioctx::device_read_async_io(const io_object& obj,
   if (size == 0) return exec::make_semi_future<size_t>(0);
   try {
     if (dst == nullptr) throw std::invalid_argument("device read destination is null");
-    std::vector<prepared_io_slice> slices{
-      prepared_io_slice{range{offset, size}, device_buffer{dst, stream}}};
+    std::vector<prepared_io_slice> slices;
+    slices.emplace_back(range{offset, size}, device_buffer{dst, stream.get()});
     slices.front().priority = resolve_priority(priority, io_priority::high);
     return host_device_readv_async_io(obj, std::move(slices));
   } catch (...) {
@@ -260,7 +261,7 @@ exec::semi_future<size_t> ioctx::device_readv_async_io(const io_object& obj,
       if (current.size() == 0) continue;
       if (current.dst == nullptr) throw std::invalid_argument("device readv destination is null");
       prepared_slices.emplace_back(range{current.offset(), current.size()},
-                                   device_buffer{current.dst, stream});
+                                   device_buffer{current.dst, stream.get()});
       prepared_slices.back().priority = resolved;
     }
     return host_device_readv_async_io(obj, std::move(prepared_slices));
@@ -386,7 +387,8 @@ exec::semi_future<std::size_t> ioctx::submit_write(const io_object& obj,
     for (auto const& current : device_slices) {
       if (current.size() == 0) continue;
       if (current.src == nullptr) throw std::invalid_argument("device write source is null");
-      slices.push_back(make_device_write_slice(current.rng, current.src, stream, -1, resolved));
+      slices.push_back(
+        make_device_write_slice(current.rng, current.src, stream.get(), -1, resolved));
     }
     if (slices.empty()) return exec::make_semi_future<std::size_t>(0);
     require_writable(*this, obj, has_device, "write");

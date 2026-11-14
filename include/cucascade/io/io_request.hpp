@@ -361,9 +361,9 @@ struct device_cpy_request {
       }
 
       if (remaining != 0) return cudaErrorInvalidValue;
-      auto const copy_status = batch.enqueue(d_buffer.stream);
+      auto const copy_status = batch.enqueue(::cuda::stream_ref{d_buffer.stream});
       if (copy_status != cudaSuccess) return copy_status;
-      return event == nullptr ? cudaSuccess : cudaEventRecord(event, d_buffer.stream.get());
+      return event == nullptr ? cudaSuccess : cudaEventRecord(event, d_buffer.stream);
     } catch (...) {
       return cudaErrorUnknown;
     }
@@ -411,9 +411,9 @@ struct device_cpy_request {
       }
 
       if (remaining != 0) return cudaErrorInvalidValue;
-      auto const copy_status = batch.enqueue(d_buffer.stream);
+      auto const copy_status = batch.enqueue(::cuda::stream_ref{d_buffer.stream});
       if (copy_status != cudaSuccess) return copy_status;
-      return event == nullptr ? cudaSuccess : cudaEventRecord(event, d_buffer.stream.get());
+      return event == nullptr ? cudaSuccess : cudaEventRecord(event, d_buffer.stream);
     } catch (...) {
       return cudaErrorUnknown;
     }
@@ -493,13 +493,16 @@ struct io_op_request {
   std::unique_ptr<device_cpy_request> device_copy;
   std::shared_ptr<grouped_coordinator> coordinator;
   std::shared_ptr<prepared_io_completion> on_complete;
-  std::vector<cache::cached_chunk*> completion_chunks;
+  /// Handles of the fragments this operation fills, handed back on completion.
+  std::vector<fragment_handle> completion_handles;
 
   void finish_success() noexcept
   {
     if (_terminal.exchange(true, std::memory_order_acq_rel)) return;
     if (kind == io_op_kind::write && obj != nullptr) { obj->note_written(io_rng.end()); }
-    if (on_complete != nullptr) { (*on_complete)(completion_chunks, true); }
+    if (on_complete != nullptr) {
+      (*on_complete)(std::span<fragment_handle const>{completion_handles}, true);
+    }
     coordinator->on_complete();
   }
 
@@ -507,7 +510,9 @@ struct io_op_request {
                     bool host_data_valid = false) noexcept
   {
     if (_terminal.exchange(true, std::memory_order_acq_rel)) return;
-    if (on_complete != nullptr) { (*on_complete)(completion_chunks, host_data_valid); }
+    if (on_complete != nullptr) {
+      (*on_complete)(std::span<fragment_handle const>{completion_handles}, host_data_valid);
+    }
     coordinator->report_error(error);
   }
 

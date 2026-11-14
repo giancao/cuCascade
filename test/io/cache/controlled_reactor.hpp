@@ -225,7 +225,8 @@ struct held_request {
       if (slice.h_buffer.is_contiguous()) {
         std::fill_n(std::get<std::uint8_t*>(slice.h_buffer.buffer), slice.size(), value);
       } else {
-        for (auto* chunk : slice.h_buffer.fragments()) {
+        for (auto const& fragment : slice.h_buffer.fragments()) {
+          auto* chunk              = cucascade::io::cache::chunk_of(fragment.handle);
           auto const begin         = std::max(slice.offset(), chunk->offset);
           auto const source_offset = begin - slice.offset();
           auto const chunk_offset  = begin - chunk->offset;
@@ -236,7 +237,7 @@ struct held_request {
       }
       if (slice.has_device_request()) {
         std::vector<std::uint8_t> const bytes(slice.size(), value);
-        auto const stream = slice.d_buffer.stream.get();
+        auto const stream = slice.d_buffer.stream;
         REQUIRE(
           cudaMemcpyAsync(
             slice.d_buffer.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice, stream) ==

@@ -609,8 +609,8 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
     return result;
   }
 
-  auto const chunks = slice.h_buffer.fragments();
-  if (chunks.empty()) {
+  auto const fragments = slice.h_buffer.fragments();
+  if (fragments.empty()) {
     throw std::invalid_argument("uring_reactor: fragmented buffer has no chunks");
   }
   if (block_size == 0) { throw std::invalid_argument("uring_reactor: cache block size is zero"); }
@@ -633,13 +633,13 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
     result.push_back(std::move(current));
   };
 
-  for (auto* chunk : chunks) {
-    if (chunk == nullptr || chunk->data == nullptr) {
+  for (auto const& fragment : fragments) {
+    if (fragment.data == nullptr) {
       throw std::invalid_argument("uring_reactor: cache fragment is not allocated");
     }
 
-    auto const [fill_begin, fill_end] =
-      cache::fill_span(chunk->state.get_fill(), chunk->offset, block_size);
+    auto const fill_begin = fragment.offset;
+    auto const fill_end   = fragment.offset + fragment.size;
     if (fill_end <= fill_begin) {
       throw std::invalid_argument("uring_reactor: cache fragment has an empty fill span");
     }
@@ -655,8 +655,8 @@ void pwrite_all(int fd, std::uint8_t const* source, std::size_t bytes, std::size
       current_end = fill_begin;
     }
 
-    current->request.iovecs.push_back(iovec{chunk->data + (fill_begin - chunk->offset), bytes});
-    current->request.completion_chunks.push_back(chunk);
+    current->request.iovecs.push_back(iovec{fragment.data, bytes});
+    current->request.completion_handles.push_back(fragment.handle);
     current->request.io_rng.size += bytes;
     current_end += bytes;
   }
@@ -1231,7 +1231,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
           slot.copy_event   = std::make_unique<cucascade::cuda::cuda_event>(cudaEventDisableTiming);
           slot.event_device = device;
         }
-        auto const stream = copy.d_buffer.stream.get();
+        auto const stream = copy.d_buffer.stream;
         auto status       = copy.copy_async(slot.op->request.io_rng, slot.op->request.iovecs);
         if (status == cudaSuccess) status = record_copy_event(slot.copy_event->get(), stream);
         if (status != cudaSuccess) {
@@ -1484,7 +1484,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         if (status != cudaSuccess) {
           // Part of the copy may already be queued into the staging blocks: let
           // the stream pass it before the blocks go back to the pool.
-          std::ignore = cudaStreamSynchronize(copy.d_buffer.stream.get());
+          std::ignore = cudaStreamSynchronize(copy.d_buffer.stream);
           settle_slot_error(slot, status);
           return;
         }
@@ -1492,7 +1492,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         staging.push_back(slot.index);
         _queued_bytes.fetch_add(slot.op->request.io_rng.size, std::memory_order_relaxed);
       } catch (...) {
-        std::ignore = cudaStreamSynchronize(copy.d_buffer.stream.get());
+        std::ignore = cudaStreamSynchronize(copy.d_buffer.stream);
         settle_slot_error(slot, std::current_exception());
       }
     };

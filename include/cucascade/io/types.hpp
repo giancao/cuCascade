@@ -22,6 +22,8 @@
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/object_identity.hpp>
 
+#include <kvikio/io/types.hpp>
+
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
@@ -99,114 +101,42 @@ struct file_descriptor {
 };
 
 // ---------------------------------------------------------------------------
-// io_object
+// Request vocabulary
 // ---------------------------------------------------------------------------
+//
+// The types an io request is made of live in kvikIO (kvikio/io/types.hpp), where
+// the I/O engines use them; they are re-exported here under their cuCascade
+// names. Two things to know when reading older code:
+//
+//  - A fragmented host_buffer holds io::fragment (file offset, memory, opaque
+//    handle), not cache chunks. The fs_cache builds fragments from the chunks it
+//    claimed (see cache::make_fragment) and gets the handles back through
+//    prepared_io_completion, once per physical operation.
+//  - host_buffer and prepared_io_slice are move-only; clone() is the explicit
+//    copy. device_buffer::stream is the raw stream handle (cudaStream_t).
 
-/**
- * @brief Abstract per-file handle.  A passive bag of native handles
- * produced by a backend reactor (e.g. file descriptors, an S3 object's
- * bucket, key and validator).  Performs no I/O of its own.
- *
- * Inherits from @c std::enable_shared_from_this so the prefetching cache can
- * take a reference to an io_object and safely extend its lifetime via
- * @c shared_from_this() — this enforces at call sites that every io_object
- * passed in is already owned by a @c std::shared_ptr.
- */
-class io_object : public std::enable_shared_from_this<io_object> {
- public:
-  virtual ~io_object() = default;
-
-  /// This open's process-wide order (see @ref next_open_generation): a later
-  /// open of a path has a larger generation than an earlier one.
-  [[nodiscard]] std::uint64_t open_generation() const noexcept { return _open_generation; }
-
-  /// The evidence that another open of this path sees the same version of the
-  /// object.  A backend overrides it with what it can prove (a local file's
-  /// stat tuple, a remote object's strong validator).  The default uses
-  /// @ref validation_tag as an @c object_tag only when the backend declares it
-  /// strong via @ref validation_tag_is_strong. Otherwise the identity is
-  /// scoped to this open (@c opened_handle, versioned by @ref open_generation),
-  /// never to the path.  A writable object always has an @c opened_handle
-  /// identity of size 0: its bytes and size change as it is written, so nothing
-  /// derived from them may be reused through another open, and its identity
-  /// stays stable while it grows.
-  [[nodiscard]] virtual object_identity identity() const
-  {
-    object_identity result;
-    auto const tag = validation_tag();
-    if (writable() || tag.empty() || !validation_tag_is_strong()) {
-      result.kind    = identity_kind::opened_handle;
-      result.size    = writable() ? 0 : size();
-      result.version = std::to_string(_open_generation);
-    } else {
-      result.kind    = identity_kind::object_tag;
-      result.size    = size();
-      result.version = std::string(tag);
-    }
-    return result;
-  }
-
-  /// The key of this object's version: @ref identity framed with
-  /// @ref raw_file_cache_id.  Two opens with equal keys may share what was
-  /// derived from either (the @c fs_cache keys its generations by it).
-  [[nodiscard]] std::string identity_cache_key() const
-  {
-    return identity().cache_key(raw_file_cache_id());
-  }
-
-  /// Backend locator, part of the identity-aware prefetching-cache key (see
-  /// @ref identity_cache_key).  Often equal to @c object_path() but may differ
-  /// for backends that need to distinguish otherwise-equal paths (versioned S3
-  /// keys, normalized URLs, …).
-  [[nodiscard]] virtual const std::string& raw_file_cache_id() const noexcept = 0;
-
-  /// The path / URL / key the caller used to construct this object.
-  [[nodiscard]] virtual const std::string& object_path() const noexcept = 0;
-
-  /// Total size of the underlying object, populated by the reactor at
-  /// construction time and stored on the io_object thereafter.
-  [[nodiscard]] virtual size_t size() const noexcept = 0;
-
-  /// Opaque cache validator observed when the object was opened; empty when
-  /// unavailable.  HTTP backends preserve quotes and a weak W/ prefix.  A
-  /// backend decides whether it may be sent back as a request condition: the
-  /// REST reactor sends a strong tag as @c If-Match on its data GETs and never
-  /// sends a weak or otherwise unusable one. The default identity uses a
-  /// nonempty tag only when @ref validation_tag_is_strong holds. The view is
-  /// valid for this object's lifetime.
-  [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
-
-  /// Whether a nonempty validation_tag() is a strong validator: equal tags
-  /// of the same size at the same raw_file_cache_id() name byte-identical
-  /// versions. Default false: an opaque tag is not reusable evidence.
-  [[nodiscard]] virtual bool validation_tag_is_strong() const noexcept { return false; }
-
-  /// True for objects returned by @c ioctx::open_io_object_for_write: the write
-  /// API accepts them.  Objects opened for reading are read-only.
-  [[nodiscard]] virtual bool writable() const noexcept { return false; }
-
-  /// A physical write ending at byte @p end completed through this object.  A
-  /// writable object grows @ref size to cover it (an atomic maximum), so reads
-  /// issued after the write's future resolved clamp to the extended size.
-  /// Called by @c io_op_request::finish_success for write operations; a no-op
-  /// for read-only objects.
-  virtual void note_written(std::size_t /*end*/) const noexcept {}
-
- private:
-  friend class ioctx;
-  friend class cache::metadata_store;
-
-  /// The metadata store's invalidation epoch of this object's path when an
-  /// ioctx opened it (see @c cache::metadata_store::register_metadata): metadata
-  /// parsed through an object opened before a write of its path is dropped.
-  std::uint64_t _metadata_epoch{0};
-
-  std::uint64_t const _open_generation = next_open_generation();
-};
-
-/// Whether a backend opened an @c io_object for reading only or for reading and
-/// writing.  A scoped enum so that no argument of another type converts to it.
-enum class io_access : std::uint8_t { read_only, read_write };
+using kvikio::io::device_buffer;
+using kvikio::io::fragment;
+using kvikio::io::fragment_handle;
+using kvikio::io::host_buffer;
+using kvikio::io::intersect;
+using kvikio::io::io_access;
+using kvikio::io::io_object;
+using kvikio::io::io_op_kind;
+using kvikio::io::io_priority;
+using kvikio::io::make_device_write_slice;
+using kvikio::io::make_flush_slice;
+using kvikio::io::make_host_write_slice;
+using kvikio::io::open_hint;
+using kvikio::io::open_options;
+using kvikio::io::prepared_io_completion;
+using kvikio::io::prepared_io_slice;
+using kvikio::io::range;
+using kvikio::io::resolve_priority;
+using kvikio::io::slice;
+using kvikio::io::write_mode;
+using kvikio::io::write_open_options;
+using kvikio::io::write_slice;
 
 /// Raise @p target to @p value if it is smaller (an atomic maximum).
 inline void atomic_store_max(std::atomic<std::size_t>& target, std::size_t value) noexcept
@@ -221,287 +151,5 @@ class io_object_metadata {
  public:
   virtual ~io_object_metadata() = default;
 };
-
-struct range {
-  std::size_t offset{0};
-  std::size_t size{0};
-
-  [[nodiscard]] std::size_t end() const noexcept
-  {
-    return size > std::numeric_limits<std::size_t>::max() - offset
-             ? std::numeric_limits<std::size_t>::max()
-             : offset + size;
-  }
-
-  [[nodiscard]] bool empty() const noexcept { return size == 0; }
-};
-
-[[nodiscard]] inline range intersect(range lhs, range rhs) noexcept
-{
-  auto const begin = std::max(lhs.offset, rhs.offset);
-  auto const end   = std::min(lhs.end(), rhs.end());
-  return end > begin ? range{begin, end - begin} : range{begin, 0};
-}
-
-struct slice {
-  slice() noexcept = default;
-
-  explicit slice(std::size_t offset, std::size_t size, std::uint8_t* dst) noexcept
-    : rng{offset, size}, dst{dst}
-  {
-    assert(dst != nullptr);
-    assert(size > 0);
-  }
-
-  [[nodiscard]] size_t size() const noexcept { return rng.size; }
-
-  [[nodiscard]] std::size_t offset() const noexcept { return rng.offset; }
-
-  range rng;
-  std::uint8_t* dst{nullptr};
-};
-
-// ---------------------------------------------------------------------------
-// Write vocabulary
-// ---------------------------------------------------------------------------
-
-/// How @c ioctx::open_io_object_for_write opens a local file.  Every mode opens
-/// the file for reading and writing.
-enum class write_mode : std::uint8_t {
-  create_or_truncate,  ///< create if missing, truncate to zero bytes otherwise
-  create_or_open,      ///< create if missing, keep the existing content otherwise
-  open_existing,       ///< fail with @c ENOENT if missing; keep the existing content
-  create_new,          ///< fail with @c EEXIST if present
-};
-
-/// Options of @c ioctx::open_io_object_for_write.
-struct write_open_options {
-  write_mode mode{write_mode::create_or_truncate};  ///< open / create behaviour
-  ::mode_t permissions{0644};                       ///< mode of a newly created file
-  /// Best-effort preallocation hint in bytes (@c fallocate with
-  /// @c FALLOC_FL_KEEP_SIZE); 0 = none.  Never changes @c size(); a backend or
-  /// filesystem that cannot preallocate ignores it.
-  std::uint64_t size_hint{0};
-};
-
-/**
- * @brief One segment of a vectored write: the file range
- *        [offset, offset + size) and the bytes to write there.
- *
- * @c src is host or device memory depending on the API it is passed to.  It
- * must stay valid and unmodified until the write's future resolves.
- */
-struct write_slice {
-  write_slice() noexcept = default;
-
-  write_slice(std::size_t offset, std::size_t size, std::uint8_t const* src) noexcept
-    : rng{offset, size}, src{src}
-  {
-  }
-
-  [[nodiscard]] std::size_t size() const noexcept { return rng.size; }
-
-  [[nodiscard]] std::size_t offset() const noexcept { return rng.offset; }
-
-  range rng;
-  std::uint8_t const* src{nullptr};
-};
-
-struct host_buffer {
-  host_buffer() noexcept = default;
-
-  explicit host_buffer(std::uint8_t* dst) noexcept : buffer(dst) { assert(dst != nullptr); }
-
-  explicit host_buffer(std::span<cache::cached_chunk*> cached_chunks)
-    : buffer(std::vector<cache::cached_chunk*>{cached_chunks.begin(), cached_chunks.end()})
-  {
-    assert(!cached_chunks.empty());
-  }
-
-  explicit host_buffer(std::vector<cache::cached_chunk*> cached_chunks)
-    : buffer(std::move(cached_chunks))
-  {
-    assert(!std::get<std::vector<cache::cached_chunk*>>(buffer).empty());
-  }
-
-  [[nodiscard]] bool needs_staging() const noexcept
-  {
-    return std::holds_alternative<std::monostate>(buffer);
-  }
-
-  [[nodiscard]] bool is_fragmented() const noexcept
-  {
-    return std::holds_alternative<std::vector<cache::cached_chunk*>>(buffer);
-  }
-
-  [[nodiscard]] bool is_contiguous() const noexcept
-  {
-    return std::holds_alternative<std::uint8_t*>(buffer);
-  }
-
-  [[nodiscard]] std::span<cache::cached_chunk* const> fragments() const noexcept
-  {
-    if (!is_fragmented()) return {};
-    return std::get<std::vector<cache::cached_chunk*>>(buffer);
-  }
-
-  std::variant<std::monostate, std::uint8_t*, std::vector<cache::cached_chunk*>> buffer;
-};
-
-struct device_buffer {
-  device_buffer() noexcept = default;
-
-  explicit device_buffer(std::uint8_t* dst, ::cuda::stream_ref stream, int device_id = -1) noexcept
-    : data(dst), stream(stream), device_id(device_id)
-  {
-    assert(dst != nullptr);
-  }
-
-  std::uint8_t* data{nullptr};
-  // The dispatcher pins null to cudaStreamLegacy and replaces cudaStreamPerThread
-  // with a stand-in: a reactor never sees a default handle whose meaning depends
-  // on its translation unit or thread. Initialize explicitly (CCCL deprecates
-  // stream_ref's default constructor).
-  ::cuda::stream_ref stream{cudaStream_t{nullptr}};
-  int device_id{-1};
-  /// Keeps alive a stream the dispatcher created in place of the caller's
-  /// (see @c detail::resolve_default_streams in templated_ioctx.hpp); null
-  /// when @c stream is the caller's own.
-  std::shared_ptr<void> stream_owner;
-};
-
-class prepared_io_completion final {
- public:
-  using callback_type = exec::invocable<void(std::span<cache::cached_chunk* const>, bool) noexcept>;
-
-  template <typename Callback>
-  explicit prepared_io_completion(Callback&& callback) : _callback(std::forward<Callback>(callback))
-  {
-  }
-
-  prepared_io_completion(prepared_io_completion const&)            = delete;
-  prepared_io_completion& operator=(prepared_io_completion const&) = delete;
-
-  void operator()(std::span<cache::cached_chunk* const> chunks, bool success) noexcept
-  {
-    std::lock_guard lock(_mutex);
-    _callback(chunks, success);
-  }
-
- private:
-  std::mutex _mutex;
-  callback_type _callback;
-};
-
-/// Which of a reactor's two queues a read waits in.  A reactor prefers its
-/// @c high queue over its @c low one, and parks an active @c low request at a
-/// slice boundary when a @c high one arrives, so a read the executor is blocked
-/// on does not queue behind bulk readahead.  The preference is not strict: a
-/// tiered reactor (uring) grants the low tier bounded service, so waiting low
-/// work is never starved by a continuous stream of high requests (see
-/// @c uring::config::low_service_interval).
-///
-/// @c automatic (the read APIs' default) always resolves to @c high: anything
-/// a caller did not explicitly mark as background is demand work it may block
-/// on, whatever the call shape.  Only an explicit @c low (the cache prefetch
-/// stamps it) lands in the low tier.
-enum class io_priority : std::uint8_t { automatic, high, low };
-
-/// @p requested, or @p fallback when it is @c io_priority::automatic.
-[[nodiscard]] constexpr io_priority resolve_priority(io_priority requested,
-                                                     io_priority fallback) noexcept
-{
-  return requested == io_priority::automatic ? fallback : requested;
-}
-
-/// What a prepared slice asks a reactor to do.  Reads are the default; writes
-/// and flushes reach only reactors that model @c io_write_reactor_c.
-enum class io_op_kind : std::uint8_t { read, write, flush };
-
-struct prepared_io_slice {
-  /// The logical caller-requested window. A reactor may widen the physical I/O
-  /// for alignment or a cached chunk's advertised fill, but device copies and
-  /// returned byte accounting remain limited to this range.  A write slice's
-  /// range is the exact file range to write (never widened, never clamped to
-  /// EOF); a flush slice's range is empty.
-  range rng;
-  host_buffer h_buffer;  // monostate if using reactor-owned staging
-  device_buffer d_buffer;
-  std::shared_ptr<prepared_io_completion> on_complete;
-  /// Reactor queue for this slice (see @ref io_priority); a request takes its
-  /// first slice's value, resolving @c automatic by call shape.
-  io_priority priority{io_priority::automatic};
-  /// Read (default), write or flush.  A write slice carries exactly one source:
-  /// a contiguous host buffer or a device buffer, which the reactor only reads.
-  io_op_kind kind{io_op_kind::read};
-
-  prepared_io_slice() noexcept = default;
-  explicit prepared_io_slice(range r, host_buffer h) noexcept : rng(r), h_buffer(std::move(h)) {}
-  explicit prepared_io_slice(range r, device_buffer d) noexcept : rng(r), d_buffer(std::move(d)) {}
-  explicit prepared_io_slice(range r, host_buffer h, device_buffer d) noexcept
-    : rng(r), h_buffer(std::move(h)), d_buffer(std::move(d))
-  {
-  }
-
-  [[nodiscard]] bool needs_staging() const noexcept { return h_buffer.needs_staging(); }
-
-  [[nodiscard]] bool is_fragmented() const noexcept { return h_buffer.is_fragmented(); }
-
-  [[nodiscard]] bool is_contiguous() const noexcept { return h_buffer.is_contiguous(); }
-
-  [[nodiscard]] bool has_host_request() const noexcept { return !h_buffer.needs_staging(); }
-
-  [[nodiscard]] bool has_device_request() const noexcept { return d_buffer.data != nullptr; }
-
-  [[nodiscard]] bool is_host_request() const noexcept
-  {
-    return !h_buffer.needs_staging() && !has_device_request();
-  }
-
-  [[nodiscard]] size_t size() const noexcept { return rng.size; }
-
-  [[nodiscard]] size_t offset() const noexcept { return rng.offset; }
-
-  [[nodiscard]] bool is_write() const noexcept { return kind == io_op_kind::write; }
-
-  [[nodiscard]] bool is_flush() const noexcept { return kind == io_op_kind::flush; }
-};
-
-/// A write slice of @p rng whose bytes come from host memory @p src (non-null).
-/// The reactor only reads @p src; the cast merely fits the shared buffer type.
-[[nodiscard]] inline prepared_io_slice make_host_write_slice(
-  range rng, std::uint8_t const* src, io_priority priority = io_priority::automatic) noexcept
-{
-  prepared_io_slice slice{rng, host_buffer{const_cast<std::uint8_t*>(src)}};
-  slice.kind     = io_op_kind::write;
-  slice.priority = priority;
-  return slice;
-}
-
-/// A write slice of @p rng whose bytes come from device memory @p src
-/// (non-null), read in stream order on @p stream.  @p device_id < 0 is resolved
-/// to the calling thread's device when the slice is dispatched.
-[[nodiscard]] inline prepared_io_slice make_device_write_slice(
-  range rng,
-  std::uint8_t const* src,
-  ::cuda::stream_ref stream,
-  int device_id        = -1,
-  io_priority priority = io_priority::automatic) noexcept
-{
-  prepared_io_slice slice{rng, device_buffer{const_cast<std::uint8_t*>(src), stream, device_id}};
-  slice.kind     = io_op_kind::write;
-  slice.priority = priority;
-  return slice;
-}
-
-/// A flush slice: make every write that completed before it durable.
-[[nodiscard]] inline prepared_io_slice make_flush_slice(
-  io_priority priority = io_priority::automatic) noexcept
-{
-  prepared_io_slice slice;
-  slice.kind     = io_op_kind::flush;
-  slice.priority = priority;
-  return slice;
-}
 
 }  // namespace cucascade::io

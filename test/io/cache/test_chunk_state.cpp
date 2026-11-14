@@ -865,26 +865,26 @@ TEST_CASE("prepared cache completion publishes only its exact physical segment",
   make_loading(pending);
 
   auto completion = std::make_shared<cucascade::io::prepared_io_completion>(
-    [](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
+    [](std::span<cucascade::io::fragment_handle const> completed, bool host_ok) noexcept {
       cucascade::io::cache::publish_chunk_fill(completed, host_ok);
     });
 
-  std::array<cached_chunk*, 1> first{&succeeded};
-  (*completion)(first, true);
+  std::array<cucascade::io::fragment_handle, 1> first{&succeeded};
+  (*completion)(std::span<cucascade::io::fragment_handle const>{first}, true);
   CHECK(succeeded.state.get_state() == chunk_state::cached);
   CHECK(failed.state.get_state() == chunk_state::loading);
   CHECK(pending.state.get_state() == chunk_state::loading);
 
-  std::array<cached_chunk*, 1> second{&failed};
-  (*completion)(second, false);
+  std::array<cucascade::io::fragment_handle, 1> second{&failed};
+  (*completion)(std::span<cucascade::io::fragment_handle const>{second}, false);
   CHECK(succeeded.state.get_state() == chunk_state::cached);
   CHECK(failed.state.get_state() == chunk_state::allocated);
   CHECK(pending.state.get_state() == chunk_state::loading);
 
   // A device-copy failure reports host_ok=true: the host cache source remains
   // valid and is published even though the request coordinator reports error.
-  std::array<cached_chunk*, 1> third{&pending};
-  (*completion)(third, true);
+  std::array<cucascade::io::fragment_handle, 1> third{&pending};
+  (*completion)(std::span<cucascade::io::fragment_handle const>{third}, true);
   CHECK(pending.state.get_state() == chunk_state::cached);
 }
 
@@ -899,7 +899,8 @@ TEST_CASE("cache callback lifetime holds teardown admission through callback own
     std::make_shared<cucascade::exec::completion_controller::slot>(inflight.acquire());
 
   auto completion = std::make_shared<cucascade::io::prepared_io_completion>(
-    [lifetime = std::move(lifetime), &invoked](std::span<cached_chunk* const>, bool) noexcept {
+    [lifetime = std::move(lifetime), &invoked](std::span<cucascade::io::fragment_handle const>,
+                                               bool) noexcept {
       std::ignore = lifetime;
       invoked.store(true);
     });
@@ -907,7 +908,7 @@ TEST_CASE("cache callback lifetime holds teardown admission through callback own
   inflight.close();
   CHECK_FALSE(drained.load());
 
-  (*completion)({}, true);
+  (*completion)(std::span<cucascade::io::fragment_handle const>{}, true);
   CHECK(invoked.load());
   CHECK_FALSE(drained.load());
 

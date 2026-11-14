@@ -135,11 +135,11 @@ inline void resolve_default_streams(std::vector<prepared_io_slice>& slices)
   std::vector<std::shared_ptr<per_thread_stream_stand_in>> stand_ins;
   for (auto& slice : slices) {
     if (!slice.has_device_request()) continue;
-    if (slice.d_buffer.stream.get() == nullptr) {
-      slice.d_buffer.stream = ::cuda::stream_ref{cudaStreamLegacy};
+    if (slice.d_buffer.stream == nullptr) {
+      slice.d_buffer.stream = cudaStreamLegacy;
       continue;
     }
-    if (slice.d_buffer.stream.get() != cudaStreamPerThread) continue;
+    if (slice.d_buffer.stream != cudaStreamPerThread) continue;
     auto const device =
       slice.d_buffer.device_id >= 0 ? slice.d_buffer.device_id : current_cuda_device();
     std::shared_ptr<per_thread_stream_stand_in> stand_in;
@@ -150,7 +150,7 @@ inline void resolve_default_streams(std::vector<prepared_io_slice>& slices)
       stand_in = std::make_shared<per_thread_stream_stand_in>(device);
       stand_ins.push_back(stand_in);
     }
-    slice.d_buffer.stream       = ::cuda::stream_ref{stand_in->get()};
+    slice.d_buffer.stream       = stand_in->get();
     slice.d_buffer.stream_owner = stand_in;
   }
 }
@@ -758,7 +758,7 @@ class templated_ioctx : public ioctx {
           std::min_element(partition_bytes.begin(), partition_bytes.end()) -
           partition_bytes.begin());
         partition_bytes[smallest] += slice.size();
-        partitions[smallest].push_back(slice);
+        partitions[smallest].push_back(slice.clone());
       }
 
       // A backend that does not prefer bulk I/O gets a host-only range read as
@@ -880,7 +880,7 @@ class templated_ioctx : public ioctx {
       while (cursor < end) {
         auto const boundary = cursor - cursor % piece + piece;
         auto const stop     = std::min(end, boundary);
-        auto part           = slice;
+        auto part           = slice.clone();
         part.rng            = range{cursor, stop - cursor};
         auto const delta    = cursor - begin;
         if (part.has_device_request()) {

@@ -138,9 +138,9 @@ TEST_CASE("device dispatch canonicalizes default stream handles before enqueue",
   REQUIRE_FALSE(held.request->slices.empty());
   for (auto const& slice : held.request->slices) {
     REQUIRE(slice.has_device_request());
-    CHECK(slice.d_buffer.stream.get() != nullptr);
-    CHECK(slice.d_buffer.stream.get() != cudaStreamPerThread);
-    if (caller_stream == nullptr) { CHECK(slice.d_buffer.stream.get() == cudaStreamLegacy); }
+    CHECK(slice.d_buffer.stream != nullptr);
+    CHECK(slice.d_buffer.stream != cudaStreamPerThread);
+    if (caller_stream == nullptr) { CHECK(slice.d_buffer.stream == cudaStreamLegacy); }
   }
   held.complete(0x5a);
   CHECK(std::move(future).get() == read_size);

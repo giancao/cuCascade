@@ -39,13 +39,7 @@ namespace cucascade::io {
 
 enum class io_context_type { uring, restful, s3rdma, cufile };
 
-/// Hint passed to @c open_io_object so a backend can tailor how it resolves an
-/// object's metadata.  @c generic resolves the size however is cheapest for the
-/// scheme (a HEAD for object stores).  @c parquet_footer_probe asks the backend
-/// to resolve the size *and* stash the object's trailing bytes in one
-/// round-trip (a suffix-range GET), so the parquet footer reads that follow are
-/// served locally instead of costing extra round-trips.
-enum class open_hint { generic, parquet_footer_probe };
+// open_hint (generic, parquet_footer_probe) is kvikIO's; see cucascade/io/types.hpp.
 
 namespace cache {
 class fs_cache;
