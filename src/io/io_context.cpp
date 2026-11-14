@@ -66,6 +66,7 @@ struct io_write_from_host_message {
     case io_context_type::restful: return "rest";
     case io_context_type::s3rdma: return "s3rdma";
     case io_context_type::cufile: return "cufile";
+    case io_context_type::cufile_posix: return "cufile_posix";
   }
   return "ioctx";
 }

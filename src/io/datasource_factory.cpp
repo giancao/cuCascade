@@ -22,6 +22,8 @@
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #endif
 #include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/engine_ioctx.hpp>
+#include <cucascade/io/host_staging_source.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
@@ -33,6 +35,10 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <kvikio/io/cufile_posix_engine.hpp>
+#include <kvikio/io/engine_registry.hpp>
+
+#include <algorithm>
 #include <cctype>
 #include <exception>
 #include <memory>
@@ -120,6 +126,30 @@ factory_type make_uring_ioctx_factory(
   };
 }
 
+/// kvikIO's built-in engine for local files, behind engine_ioctx.  The engine
+/// is selected in kvikIO's process-wide registry and stages device transfers
+/// through the first HOST space, so that memory stays in cuCascade's budget.
+factory_type make_cufile_posix_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager)
+{
+  return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
+    try {
+      kvikio::io::cufile_posix_options options;
+      options.num_threads =
+        static_cast<unsigned int>(std::max<std::size_t>(1, config.cufile_posix_n_threads));
+      if (auto* host_mr = first_host_resource(reservation_manager); host_mr != nullptr) {
+        options.staging = std::make_shared<host_staging_source>(*host_mr);
+      }
+      auto engine = kvikio::io::engine_registry::instance().select(
+        kvikio::io::engine_route::local, kvikio::io::cufile_posix_engine_name, options);
+      return std::make_shared<engine_ioctx>(std::move(engine), io_context_type::cufile_posix);
+    } catch (const std::exception& e) {
+      CUCASCADE_LOG_ERROR("make_cufile_posix_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
+}
+
 factory_type make_rest_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
@@ -157,10 +187,12 @@ io_context_registry::io_context_registry(
   config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
   : _config(std::move(config)),
     _reservation_manager(reservation_manager),
-    _prefer_cufile(_config.backend == io_backend::cufile)
+    _local_type(_config.backend == io_backend::cufile         ? io_context_type::cufile
+                : _config.backend == io_backend::cufile_posix ? io_context_type::cufile_posix
+                                                              : io_context_type::uring)
 {
 #ifndef CUCASCADE_HAS_CUFILE
-  if (_prefer_cufile) {
+  if (_local_type == io_context_type::cufile) {
     throw std::invalid_argument(
       "io_context_registry: io_backend::cufile requested, but this cuCascade build has no cuFile "
       "backend (cufile.h was not found at configure time)");
@@ -180,6 +212,10 @@ io_context_registry::io_context_registry(
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
                          make_uring_ioctx_factory(_reservation_manager)});
+  _entries.emplace(io_context_type::cufile_posix,
+                   entry{io_context_type::cufile_posix,
+                         &uring::uring_reactor::supports,
+                         make_cufile_posix_ioctx_factory(_reservation_manager)});
   _entries.emplace(io_context_type::restful,
                    entry{io_context_type::restful,
                          &rest::rest_reactor::supports,
@@ -235,8 +271,9 @@ std::optional<io_context_type> io_context_registry::lookup_path(
   //   * native -- skip cufile for local files (uring wins); rest keeps s3://.
   for (const auto& [type, entry] : _entries) {
     if (!entry.checker(path)) continue;
-    if (_prefer_cufile && type == io_context_type::uring) { continue; }
-    if (!_prefer_cufile && type == io_context_type::cufile) { continue; }
+    bool const local = type == io_context_type::uring || type == io_context_type::cufile ||
+                       type == io_context_type::cufile_posix;
+    if (local && type != _local_type) { continue; }
     return type;
   }
   return std::nullopt;
