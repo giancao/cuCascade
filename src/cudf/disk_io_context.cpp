@@ -22,14 +22,19 @@
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/platform.hpp>
 #endif
+#include <cucascade/io/engine_ioctx.hpp>
+#include <cucascade/io/host_staging_source.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/log/logging.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
+#include <kvikio/io/cufile_posix_engine.hpp>
+
 #include <liburing.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -154,6 +159,29 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
   }
 }
 
+/**
+ * @brief Pinned staging owned by a private cufile_posix engine.
+ *
+ * The engine holds this source for as long as it lives, so the blocks outlive every lease.
+ */
+class owned_engine_staging final : public kvikio::io::staging_source, private owned_uring_staging {
+ public:
+  owned_engine_staging(std::size_t n_threads, int numa_node)
+    : owned_uring_staging(n_threads, numa_node), _source(_staging)
+  {
+  }
+
+  [[nodiscard]] std::size_t block_size() const noexcept override { return _source.block_size(); }
+
+  [[nodiscard]] kvikio::io::staging_result acquire(std::size_t bytes) noexcept override
+  {
+    return _source.acquire(bytes);
+  }
+
+ private:
+  io::host_staging_source _source;
+};
+
 [[nodiscard]] std::shared_ptr<io::ioctx> build_context(disk_io_context_options const& options,
                                                        disk_io_backend backend)
 {
@@ -169,6 +197,18 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
       throw std::invalid_argument(
         "make_disk_io_context: the cufile backend was requested but this build has no cufile.h");
 #endif
+    }
+    case disk_io_backend::cufile_posix: {
+      // A private engine, not the one selected for scans in kvikIO's registry.
+      auto const n_threads = std::max<std::size_t>(1, cfg.cufile_posix_n_threads);
+      kvikio::io::cufile_posix_options engine_options;
+      engine_options.num_threads = static_cast<unsigned int>(n_threads);
+      engine_options.staging =
+        std::make_shared<owned_engine_staging>(n_threads, options.staging_numa_node);
+      auto engine = kvikio::io::make_cufile_posix_engine(engine_options);
+      engine->start();
+      return std::make_shared<io::engine_ioctx>(std::move(engine),
+                                                io::io_context_type::cufile_posix);
     }
     case disk_io_backend::uring:
     case disk_io_backend::automatic: break;
