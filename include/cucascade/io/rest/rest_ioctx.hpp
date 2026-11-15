@@ -88,6 +88,10 @@ class rest_ioctx : public engine_ioctx {
   /// Counters of the whole pool.  A snapshot; safe while the pool runs.
   [[nodiscard]] transport_stats stats() const noexcept { return _api->stats(); }
 
+  /// How many reactors one read is spread over: the configured fan-out, clamped
+  /// to the size of the pool.
+  [[nodiscard]] std::size_t dispatch_fanout() const noexcept { return _api->fan_out(); }
+
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink.
   void list_objects_paged(std::string_view bucket,
                           std::string_view prefix,
