@@ -25,12 +25,14 @@
 
 #include <cucascade/io/config.hpp>
 #include <cucascade/io/engine_ioctx.hpp>
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/config.hpp>
 #include <cucascade/io/rest/forward.hpp>
 #include <cucascade/io/rest/rest_reactor.hpp>
 
 #include <kvikio/io/nic_topology.hpp>
+#include <kvikio/io/object_listing.hpp>
 #include <kvikio/io/rest/uring_http_api.hpp>
 #include <kvikio/io/rest/uring_http_engine.hpp>
 
@@ -59,38 +61,52 @@ namespace cucascade::io::rest {
   std::string_view interface) noexcept;
 
 /**
- * @brief An @c engine_ioctx over the `uring_http` engine: object stores
- *        (s3://) over HTTP/1.1 on io_uring.
+ * @brief An @c engine_ioctx over an object-store engine (s3://).
  *
- * The data path and the opens go through the engine interface. LIST, batched
- * footer resolution and the transport counters are the engine's own
- * (@c kvikio::io::rest::uring_http_api) and are forwarded here under the names
- * they always had.
+ * Normally the `uring_http` engine: HTTP/1.1 on io_uring. The data path and the
+ * opens go through the engine interface; LIST, batched footer resolution and the
+ * transport counters are the engine's own and are forwarded here under the
+ * names they always had.
  *
- * Build one with @ref make_rest_ioctx, which gets the engine by name from
- * kvikIO's engine registry.
+ * It can also be served by kvikIO's built-in `curl` engine, the fallback when
+ * `uring_http` cannot be used. That engine reads and lists but has no batched
+ * footer resolution and no transport counters: @ref resolve_footer_objects
+ * throws, and the counters read as zero. @ref has_transport_api tells which.
+ *
+ * Build one with @ref make_rest_ioctx or @ref make_curl_rest_ioctx.
  */
 class rest_ioctx : public engine_ioctx {
  public:
-  /// Serve @p engine, which must be the `uring_http` engine.
-  /// @throws std::invalid_argument when it is another engine.
+  /// Serve @p engine, which must list objects (the `uring_http` or `curl` engine).
+  /// @throws std::invalid_argument when it does not.
   explicit rest_ioctx(std::shared_ptr<kvikio::io::engine> engine);
 
   /// Build a pool of @p n_reactors reactors (0 = sized from the egress NIC),
   /// all sharing @p ctx, whose staging source the caller keeps alive.  Creates
-  /// the engine directly, which needs the engine plugin at link time
-  /// (`kvikio::engine_uring_http`); tests and benchmarks do that.
+  /// the `uring_http` engine directly, which needs the engine plugin at link
+  /// time (`kvikio::engine_uring_http`); tests and benchmarks do that.
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
     : rest_ioctx(make_engine(n_reactors, std::move(ctx)))
   {
   }
 
-  /// Counters of the whole pool.  A snapshot; safe while the pool runs.
-  [[nodiscard]] transport_stats stats() const noexcept { return _api->stats(); }
+  /// Whether the engine is `uring_http`, with its transport counters, fan-out
+  /// and batched footer resolution; false when the `curl` engine serves this.
+  [[nodiscard]] bool has_transport_api() const noexcept { return _api != nullptr; }
+
+  /// Counters of the whole pool.  A snapshot; safe while the pool runs.  All
+  /// zero without the transport interface.
+  [[nodiscard]] transport_stats stats() const noexcept
+  {
+    return _api != nullptr ? _api->stats() : transport_stats{};
+  }
 
   /// How many reactors one read is spread over: the configured fan-out, clamped
-  /// to the size of the pool.
-  [[nodiscard]] std::size_t dispatch_fanout() const noexcept { return _api->fan_out(); }
+  /// to the size of the pool.  1 without the transport interface.
+  [[nodiscard]] std::size_t dispatch_fanout() const noexcept
+  {
+    return _api != nullptr ? _api->fan_out() : std::size_t{1};
+  }
 
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink.
   void list_objects_paged(std::string_view bucket,
@@ -99,7 +115,7 @@ class rest_ioctx : public engine_ioctx {
                           std::function<bool(s3::list_objects_v2_page const&)> const& sink,
                           std::optional<std::size_t> max_scanned = std::nullopt)
   {
-    _api->list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
+    _listing->list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
   }
 
   /// The entries of a bucket under @p prefix.
@@ -109,28 +125,30 @@ class rest_ioctx : public engine_ioctx {
     std::size_t page_size               = 1000,
     std::optional<std::size_t> max_keys = std::nullopt)
   {
-    return _api->list_objects(bucket, prefix, page_size, max_keys);
+    return _listing->list_objects(bucket, prefix, page_size, max_keys);
   }
 
   /// The configured cap on the matches of one listing.
-  [[nodiscard]] std::size_t list_max_matches() const { return _api->list_max_matches(); }
+  [[nodiscard]] std::size_t list_max_matches() const { return _listing->list_max_matches(); }
 
   /// Resolve the size and footer bytes of a batch of objects.
+  /// @throws not_implemented_error without the transport interface.
   void resolve_footer_objects(std::span<std::string const> paths,
                               std::function<void(footer_resolve_result)> const& on_result,
                               std::stop_token stop = {})
   {
+    if (_api == nullptr) { throw not_implemented_error("rest: resolve_footer_objects"); }
     _api->resolve_footer_objects(paths, on_result, std::move(stop));
   }
 
   [[nodiscard]] std::size_t footer_stash_reserved_bytes() const noexcept
   {
-    return _api->footer_stash_reserved_bytes();
+    return _api != nullptr ? _api->footer_stash_reserved_bytes() : std::size_t{0};
   }
 
   [[nodiscard]] std::size_t footer_stash_reserved_peak_bytes() const noexcept
   {
-    return _api->footer_stash_reserved_peak_bytes();
+    return _api != nullptr ? _api->footer_stash_reserved_peak_bytes() : std::size_t{0};
   }
 
  private:
@@ -143,6 +161,7 @@ class rest_ioctx : public engine_ioctx {
       n_reactors, std::move(ctx), std::move(nic));
   }
 
+  kvikio::io::object_listing* _listing;
   kvikio::io::rest::uring_http_api* _api;
 };
 
@@ -162,6 +181,19 @@ class rest_ioctx : public engine_ioctx {
   config cfg,
   object_store_config const& object_store,
   std::shared_ptr<kvikio::io::staging_source> staging);
+
+/**
+ * @brief Select kvikIO's built-in `curl` engine for s3:// paths and serve it.
+ *
+ * The fallback for when `uring_http` cannot be used.  It signs for
+ * @p object_store (endpoint, region and credentials override the `AWS_*`
+ * environment variables) and stages device reads through @p staging.
+ *
+ * @throws kvikio::io::engine_selection_error when kvikIO was built without
+ *         remote support.
+ */
+[[nodiscard]] std::shared_ptr<rest_ioctx> make_curl_rest_ioctx(
+  object_store_config const& object_store, std::shared_ptr<kvikio::io::staging_source> staging);
 
 /**
  * @brief The CPUs a REST pool built now from the calling thread would pin its reactors to.

@@ -105,6 +105,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/test_object_store_lister.cpp
     io/rest/test_rest_cache_identity.cpp
     io/rest/test_rest_footer_resolve.cpp
+    io/rest/test_rest_curl_fallback.cpp
     io/rest/test_rest_https.cpp
     io/rest/test_rest_pool_parity.cpp
     io/rest/test_rest_pool_plan.cpp

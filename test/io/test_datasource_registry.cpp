@@ -15,9 +15,12 @@
  * limitations under the License.
  */
 
+#include "io/rest/loopback_range_server.hpp"
+#include "io/rest/rest_contract_test_utils.hpp"
 #include "log/log_test_utils.hpp"
 
 #include <cucascade/io/config.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
 #ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #endif
@@ -274,6 +277,33 @@ TEST_CASE("the uring context is served by kvikIO's uring engine plugin", "[io][r
   context.reset();
   CHECK(
     kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local).empty());
+}
+
+// The uring_http engine exists but cannot be created (here: an explicit fan-out larger than the
+// pool). That may be transient, so there is no backend rather than a fallback to the curl
+// engine; the fallback is for a process in which the engine's plugin cannot be loaded at all.
+TEST_CASE("a REST context that cannot be created is not replaced by the curl engine",
+          "[io][registry][rest][curl]")
+{
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(1ULL << 30)
+    .set_per_numa_region_capacity(512ULL << 20)
+    .use_gpu_id_as_host_id();
+  memory_reservation_manager manager{builder.build()};
+  io_config config{};
+  config.object_store.endpoint   = "http://127.0.0.1:9";
+  config.object_store.region     = "us-east-1";
+  config.object_store.access_key = "test-access-key";
+  config.object_store.secret_key = "test-secret-key";
+  config.rest_n_reactors         = 1;
+  config.rest.fan_out            = 64;
+  io_context_registry registry{config, manager};
+
+  CHECK(registry.make_ioctx(io_context_type::restful) == nullptr);
+  CHECK(kvikio::io::engine_registry::instance().has_factory("uring_http"));
+  CHECK(
+    kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::s3).empty());
 }
 
 // What a kvikIO engine logs reaches cuCascade's sink: here the registry's report of a
