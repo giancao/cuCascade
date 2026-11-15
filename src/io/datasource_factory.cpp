@@ -38,6 +38,10 @@
 #include <kvikio/io/errors.hpp>
 #include <kvikio/io/uring/uring_engine.hpp>
 
+#include <linux/io_uring.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cctype>
 #include <exception>
@@ -74,6 +78,21 @@ bool object_store_configured(const object_store_config& os)
 {
   return !(os.endpoint.empty() || os.region.empty() || os.access_key.empty() ||
            os.secret_key.empty());
+}
+
+/// Whether this process may set up an io_uring ring at all (container seccomp
+/// profiles, gVisor and kernel.io_uring_disabled can forbid it).  Probed once,
+/// with the system call itself: the io library does not link liburing.
+bool io_uring_usable() noexcept
+{
+  static bool const usable = [] {
+    io_uring_params params{};
+    auto const ring = ::syscall(__NR_io_uring_setup, 1U, &params);
+    if (ring < 0) { return false; }
+    ::close(static_cast<int>(ring));
+    return true;
+  }();
+  return usable;
 }
 
 /// An s3:// URL: what the REST engine serves.
@@ -136,9 +155,20 @@ factory_type make_uring_ioctx_factory(
         kvikio::io::engine_route::local, kvikio::io::uring::uring_engine_name, options);
       return std::make_shared<uring::uring_ioctx>(std::move(engine));
     } catch (kvikio::io::engine_selection_error const& e) {
-      // The engine cannot be used in this process (its plugin is missing,
-      // io_uring is disabled, ...).  That is reported, and local files are
-      // served by kvikIO's built-in engine instead of not at all.
+      // Fall back only when the engine cannot be used in this process at all:
+      // its plugin could not be loaded, or io_uring is not allowed here.  That
+      // is reported, and local files are served by kvikIO's built-in engine
+      // instead of not at all.  When the engine exists and io_uring works, the
+      // failure is the configuration's or a shortage (no reactors, staging that
+      // does not fit the HOST pool): report no backend, as before the engines
+      // moved, so a host that requires this context fails instead of running on
+      // an engine it did not ask for.
+      if (kvikio::io::engine_registry::instance().has_factory(
+            kvikio::io::uring::uring_engine_name) &&
+          io_uring_usable()) {
+        CUCASCADE_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
+        return nullptr;
+      }
       CUCASCADE_LOG_ERROR(
         "make_uring_ioctx_factory: {}; local files are served by the cufile_posix engine",
         e.what());

@@ -70,7 +70,7 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
 - Each engine is a kvikIO plugin built next to `libkvikio.so`: `libkvikio_engine_uring.so`,
   `libkvikio_engine_cufile_reactor.so`, `libkvikio_engine_uring_http.so`. The cuCascade libraries
   do not link them; the factories select an engine by name in kvikIO's registry
-  (`make_uring_ioctx_factory` falls back to the built-in `cufile_posix` engine when that fails).
+  (`make_uring_ioctx_factory` falls back to the built-in `cufile_posix` engine only when the plugin cannot be loaded or io_uring is not allowed in the process; `make_rest_ioctx_factory` falls back to `curl` only when the plugin cannot be loaded. An engine that exists but cannot be created yields no context).
   Tests and benchmarks that use reactor, transport or TLS classes directly, or build an ioctx
   from a reactor context, link the plugin target (`kvikio::engine_uring`,
   `kvikio::engine_cufile_reactor`, `kvikio::engine_uring_http`); `make_reactor_context` wraps a
