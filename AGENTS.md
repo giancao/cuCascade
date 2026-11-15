@@ -48,11 +48,25 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   `-DCUCASCADE_BUILD_IO=OFF -DCUCASCADE_USE_KVIKIO=OFF`. To build another checkout, set
   `CUCASCADE_KVIKIO_SOURCE_DIR`; set it to an empty string to link an installed kvikIO, which
   must be the POC fork (upstream kvikIO lacks the `kvikio/exec` and `kvikio/io` headers).
-- `cucascade::exec::{semi_future,promise,future,try_t,invocable}`, `cucascade::io::byte_range` and
-  `cucascade::io::object_identity` are re-exports of the kvikIO types of the same name
-  (`kvikio/exec/`, `kvikio/io/`). Change them in the kvikIO submodule, not here.
-  `CUCASCADE_USE_ABSEIL_INVOCABLE` is passed on to the kvikIO build as
-  `KvikIO_USE_ABSEIL_INVOCABLE`; the two must agree.
+- Much of the io layer now lives in the kvikIO submodule and is re-exported here under its
+  cuCascade name: `cucascade::exec::{semi_future,promise,future,try_t,invocable}`, the request
+  types in `io/types.hpp` and `io/io_request.hpp`, `byte_range`, `object_identity`, `io_utils`,
+  `tiered_queue`, `slot_pool`, the URI parser, the S3 listing code, and everything under
+  `io/uring/`. `templated_ioctx` is glue over kvikIO's `reactor_dispatch`. Change these in the
+  kvikIO submodule (`kvikio/cpp/include/kvikio/{exec,io}`), commit there first, then bump the
+  submodule here. `CUCASCADE_USE_ABSEIL_INVOCABLE` and the moodycamel namespace are passed on to
+  the kvikIO build and must agree with it.
+- The io_uring reactor is kvikIO's engine plugin `libkvikio_engine_uring.so`, built next to
+  `libkvikio.so`. The cuCascade libraries do not link it: `make_uring_ioctx_factory` selects the
+  engine by name in kvikIO's registry and falls back to the built-in `cufile_posix` engine when
+  that fails. Tests and benchmarks that use `uring_reactor` or build a `uring_ioctx` from a
+  reactor context link `kvikio::engine_uring`; `make_reactor_context` wraps a HOST memory
+  resource for them.
+- The REST and cuFile reactors are still here and still use the CUDA runtime; where their
+  statuses meet kvikIO's request types (`CUresult`), convert with `to_driver_status` /
+  `to_runtime_status` (`io/io_request.hpp`).
+- Running a kvikIO gtest from a standalone kvikIO build needs
+  `LD_PRELOAD=<build>/libkvikio.so`, or the conda copy of kvikIO is loaded instead.
 
 ## Before you finish
 
