@@ -89,4 +89,13 @@ kvikio::io::staging_result host_staging_source::acquire(std::size_t bytes) noexc
   return result;
 }
 
+std::exception_ptr host_staging_source::exhausted_error(char const* what) const noexcept
+{
+  try {
+    return std::make_exception_ptr(rmm::out_of_memory(what != nullptr ? what : ""));
+  } catch (...) {
+    return std::current_exception();
+  }
+}
+
 }  // namespace cucascade::io

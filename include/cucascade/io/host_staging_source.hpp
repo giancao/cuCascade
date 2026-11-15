@@ -28,6 +28,7 @@
 #include <kvikio/io/staging_source.hpp>
 
 #include <cstddef>
+#include <exception>
 
 namespace cucascade::io {
 
@@ -54,6 +55,10 @@ class host_staging_source final : public kvikio::io::staging_source {
   }
 
   [[nodiscard]] kvikio::io::staging_result acquire(std::size_t bytes) noexcept override;
+
+  /// Exhaustion is an @c rmm::out_of_memory, the type hosts of cuCascade retry
+  /// on, as it was when the reactors allocated from the resource themselves.
+  [[nodiscard]] std::exception_ptr exhausted_error(char const* what) const noexcept override;
 
  private:
   memory::fixed_size_host_memory_resource& _resource;

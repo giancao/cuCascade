@@ -555,7 +555,7 @@ struct listing_fixture {
     : server(std::move(pages), std::move(source)),
       authorizer(std::make_shared<loopback_list_authorizer>(server.endpoint()))
   {
-    auto context = std::make_shared<rest_reactor::reactor_context>(
+    auto context = cucascade::io::rest::make_reactor_context(
       listing_config(list_max_matches, list_max_scanned), authorizer, nullptr);
     ioctx = std::make_shared<rest_ioctx>(1, std::move(context));
     ioctx->start();
@@ -565,7 +565,7 @@ struct listing_fixture {
     : server({}, std::move(source)),
       authorizer(std::make_shared<loopback_list_authorizer>(server.endpoint()))
   {
-    auto context = std::make_shared<rest_reactor::reactor_context>(cfg, authorizer, nullptr);
+    auto context = cucascade::io::rest::make_reactor_context(cfg, authorizer, nullptr);
     ioctx        = std::make_shared<rest_ioctx>(1, std::move(context));
     ioctx->start();
   }
@@ -822,9 +822,8 @@ TEST_CASE("rest LIST loop watchdog child runner", "[.][rest][listing][watchdog_c
   auto const* endpoint = std::getenv("CUCASCADE_TEST_REST_LIST_WATCHDOG_ENDPOINT");
   if (endpoint == nullptr) { SKIP("requires the parent-owned LIST endpoint"); }
   auto authorizer = std::make_shared<loopback_list_authorizer>(endpoint);
-  auto services =
-    std::make_shared<rest_reactor::reactor_context>(listing_config(), authorizer, nullptr);
-  auto context = std::make_shared<rest_ioctx>(1, std::move(services));
+  auto services = cucascade::io::rest::make_reactor_context(listing_config(), authorizer, nullptr);
+  auto context  = std::make_shared<rest_ioctx>(1, std::move(services));
   context->start();
   std::string error;
   try {

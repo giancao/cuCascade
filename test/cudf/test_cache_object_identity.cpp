@@ -183,7 +183,7 @@ struct rest_cache_fixture {
     cfg.retry_jitter            = 0ms;
     cfg.honor_retry_after       = false;
     auto authorizer             = std::make_shared<list_capable_mock_authorizer>(server.endpoint());
-    auto reactor_context        = std::make_shared<rest_reactor::reactor_context>(
+    auto reactor_context        = cucascade::io::rest::make_reactor_context(
       cfg,
       std::move(authorizer),
       const_cast<cucascade::memory::memory_space*>(host)

@@ -26,8 +26,7 @@
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/object_store_config.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
-#include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
-#include <cucascade/io/rest/s3/static_credentials.hpp>
+#include <cucascade/io/uri_parser.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/log/logging.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -69,24 +68,22 @@ cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
   return host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
 }
 
-/// Build a SigV4 authorizer from the object-store credentials, or nullptr when
-/// the store is not configured (empty endpoint / credentials / region — which
-/// disables the REST backend).  The signing form follows @c s3_signing_mode.
-std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_config& os)
+/// Whether the object store is configured.  An empty endpoint, region or
+/// credential disables the REST backend.
+bool object_store_configured(const object_store_config& os)
 {
-  if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() || os.secret_key.empty()) {
-    return nullptr;
+  return !(os.endpoint.empty() || os.region.empty() || os.access_key.empty() ||
+           os.secret_key.empty());
+}
+
+/// An s3:// URL: what the REST engine serves.
+bool is_s3_url(std::string_view path)
+{
+  try {
+    return parse(path).scheme == "s3";
+  } catch (...) {
+    return false;
   }
-  auto creds = rest::s3::static_credentials_from(os);
-  switch (os.s3_signing_mode) {
-    case object_store_config::signing_mode::header:
-      return std::make_shared<rest::s3::sigv4_header_authorizer>(
-        std::move(creds), os.region, os.endpoint);
-    case object_store_config::signing_mode::presigned:
-      return std::make_shared<rest::s3::sigv4_presigned_authorizer>(
-        std::move(creds), os.region, os.endpoint);
-  }
-  return nullptr;
 }
 
 }  // namespace
@@ -182,8 +179,7 @@ factory_type make_rest_ioctx_factory(
 {
   return [&reservation_manager](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
-      auto authorizer = make_s3_authorizer(config.object_store);
-      if (!authorizer) {
+      if (!object_store_configured(config.object_store)) {
         CUCASCADE_LOG_WARN(
           "make_rest_ioctx_factory: object store not configured (endpoint / credentials / "
           "region missing); REST backend disabled");
@@ -196,9 +192,12 @@ factory_type make_rest_ioctx_factory(
       // presigns for, so source these from object_store rather than rest config.
       rest_cfg.ca_bundle_path = config.object_store.ca_bundle_path;
       rest_cfg.tls_verify     = config.object_store.tls_verify;
-      auto ctx                = std::make_shared<rest::rest_reactor::reactor_context>(
-        std::move(rest_cfg), std::move(authorizer), host_mr);
-      return std::make_shared<rest::rest_ioctx>(config.rest_n_reactors, std::move(ctx));
+      // The engine signs for the object store itself (SigV4, in the form its
+      // s3_signing_mode names) and is selected by name in kvikIO's registry.
+      std::shared_ptr<kvikio::io::staging_source> staging;
+      if (host_mr != nullptr) { staging = std::make_shared<host_staging_source>(*host_mr); }
+      return rest::make_rest_ioctx(
+        config.rest_n_reactors, std::move(rest_cfg), config.object_store, std::move(staging));
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -243,10 +242,9 @@ io_context_registry::io_context_registry(
                    entry{io_context_type::cufile_posix,
                          &is_local_regular_file,
                          make_cufile_posix_ioctx_factory(_reservation_manager)});
-  _entries.emplace(io_context_type::restful,
-                   entry{io_context_type::restful,
-                         &rest::rest_reactor::supports,
-                         make_rest_ioctx_factory(_reservation_manager)});
+  _entries.emplace(
+    io_context_type::restful,
+    entry{io_context_type::restful, &is_s3_url, make_rest_ioctx_factory(_reservation_manager)});
 }
 
 void io_context_registry::register_ioctx(io_context_type type,

@@ -171,7 +171,13 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
                                                    CUDA::cudart_static)
   # The uring tests drive the reactor classes directly, which live in kvikIO's
   # io_uring engine plugin.
-  target_link_libraries(cucascade_io_tests PRIVATE kvikio::engine_uring)
+  target_link_libraries(cucascade_io_tests PRIVATE kvikio::engine_uring
+                                                   kvikio::engine_uring_http)
+  # The tests of the REST layers (HTTP codec, network transport, TLS) include
+  # kvikIO's private headers and name them through cucascade::io; this header
+  # makes those names resolve in every test file.
+  target_compile_options(cucascade_io_tests
+                         PRIVATE -include cucascade/io/rest/forward.hpp)
   if(TARGET kvikio_engine_cufile_reactor)
     target_link_libraries(cucascade_io_tests
                           PRIVATE kvikio::engine_cufile_reactor)
@@ -232,6 +238,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     cucascade_cudf_tests
     PRIVATE cucascade_cudf Catch2::Catch2 CUDA::cudart_static
             cudf::cudftest_default_stream)
+  # test_cache_object_identity builds a REST context from its own reactor
+  # context, which creates kvikIO's uring_http engine directly.
+  if(TARGET kvikio_engine_uring_http)
+    target_link_libraries(cucascade_cudf_tests
+                          PRIVATE kvikio::engine_uring_http)
+  endif()
 
   # Register tests with CTest
   add_test(NAME cucascade_cudf_tests COMMAND cucascade_cudf_tests)

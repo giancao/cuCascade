@@ -372,7 +372,7 @@ int main(int argc, char** argv)
     std::cout << "REST   : n_reactors=" << n_threads
               << "  max_connections=" << rest_cfg.max_connections << "\n";
     auto authorizer = std::make_shared<awssdk_presigned_authorizer>(s3_client);
-    auto rest_ctx   = std::make_shared<cucascade::io::rest::rest_reactor::reactor_context>(
+    auto rest_ctx   = cucascade::io::rest::make_reactor_context(
       std::move(rest_cfg), std::move(authorizer), &host_mr);
     io_ctx = std::make_shared<cucascade::io::rest::rest_ioctx>(n_threads, std::move(rest_ctx));
     io_ctx->start();

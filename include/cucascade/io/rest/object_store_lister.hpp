@@ -22,16 +22,10 @@
  * @file object_store_lister.hpp
  * @brief Paged listing of an object store, independent of the transport.
  *
- * The implementation lives in kvikIO (`kvikio/io/rest/object_store_lister.hpp`);
- * this header re-exports it in `cucascade::io::rest`.
+ * Lives in kvikIO (`kvikio/io/rest/object_store_lister.hpp`); see `cucascade/io/rest/forward.hpp`
+ * for how `cucascade::io::rest` and `cucascade::io::tls` name it.
  */
 
-#include <cucascade/io/rest/s3/list_parser.hpp>
+#include <cucascade/io/rest/forward.hpp>
 
 #include <kvikio/io/rest/object_store_lister.hpp>
-
-namespace cucascade::io::rest {
-
-using kvikio::io::rest::object_store_lister;
-
-}  // namespace cucascade::io::rest
