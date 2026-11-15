@@ -37,6 +37,7 @@
 
 #include <kvikio/io/cufile_posix_engine.hpp>
 #include <kvikio/io/engine_registry.hpp>
+#include <kvikio/io/errors.hpp>
 #include <kvikio/io/uring/uring_engine.hpp>
 
 #include <algorithm>
@@ -116,6 +117,9 @@ bool is_local_regular_file(std::string_view path)
   return std::filesystem::is_regular_file(std::filesystem::path{path}, ec) && !ec;
 }
 
+factory_type make_cufile_posix_ioctx_factory(
+  cucascade::memory::memory_reservation_manager& reservation_manager);
+
 /// kvikIO's `uring` engine, selected by name in kvikIO's process-wide registry
 /// (which loads its plugin) and staging through the first HOST space.
 factory_type make_uring_ioctx_factory(
@@ -136,6 +140,14 @@ factory_type make_uring_ioctx_factory(
       auto engine        = kvikio::io::engine_registry::instance().select(
         kvikio::io::engine_route::local, kvikio::io::uring::uring_engine_name, options);
       return std::make_shared<uring::uring_ioctx>(std::move(engine));
+    } catch (kvikio::io::engine_selection_error const& e) {
+      // The engine cannot be used in this process (its plugin is missing,
+      // io_uring is disabled, ...).  That is reported, and local files are
+      // served by kvikIO's built-in engine instead of not at all.
+      CUCASCADE_LOG_ERROR(
+        "make_uring_ioctx_factory: {}; local files are served by the cufile_posix engine",
+        e.what());
+      return make_cufile_posix_ioctx_factory(reservation_manager)(config);
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
       return nullptr;

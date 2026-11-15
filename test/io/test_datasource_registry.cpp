@@ -23,6 +23,7 @@
 #include <cucascade/io/engine_ioctx.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <kvikio/io/engine_registry.hpp>
 
@@ -233,6 +234,73 @@ TEST_CASE("the cufile_posix context is served by kvikIO's built-in engine",
   CHECK(magic == std::array<std::uint8_t, 4>{0x7f, 'E', 'L', 'F'});
 
   context->shutdown();
+}
+
+TEST_CASE("the uring context is served by kvikIO's uring engine plugin", "[io][registry][uring]")
+{
+  // A HOST space gives the reactors their pinned staging.
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(1ULL << 30)
+    .set_per_numa_region_capacity(512ULL << 20)
+    .use_gpu_id_as_host_id();
+  memory_reservation_manager manager{builder.build()};
+  io_config config{};
+  config.uring_n_reactors = 1;
+  io_context_registry registry{config, manager};
+
+  auto context = registry.make_ioctx(io_context_type::uring);
+  REQUIRE(context != nullptr);
+  if (context->type() != io_context_type::uring) {
+    SKIP("io_uring is not usable in this process; the context fell back to cufile_posix");
+  }
+  auto* front = dynamic_cast<cucascade::io::engine_ioctx*>(context.get());
+  REQUIRE(front != nullptr);
+  CHECK(front->engine().name() == "uring");
+  CHECK(kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local) ==
+        "uring");
+  CHECK(context->can_use_fs_cache());
+  CHECK(front->engine().capabilities().priority);
+
+  auto object = context->open_io_object("/proc/self/exe");
+  std::array<std::uint8_t, 4> magic{};
+  auto future = context->host_read_async_io(*object, 0, magic.size(), magic.data());
+  CHECK(std::move(future).get(std::chrono::seconds{30}) == magic.size());
+  CHECK(magic == std::array<std::uint8_t, 4>{0x7f, 'E', 'L', 'F'});
+
+  // Destroying the context shuts the engine down and stops selecting it.
+  context.reset();
+  CHECK(
+    kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local).empty());
+}
+
+// The uring engine cannot be created (here: no reactors). That is reported, and
+// local files are served by the built-in engine rather than not at all.
+TEST_CASE("a uring context that cannot be created falls back to cufile_posix",
+          "[io][registry][uring]")
+{
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(1ULL << 30)
+    .set_per_numa_region_capacity(512ULL << 20)
+    .use_gpu_id_as_host_id();
+  memory_reservation_manager manager{builder.build()};
+  io_config config{};
+  config.uring_n_reactors = 0;
+  io_context_registry registry{config, manager};
+
+  auto context = registry.make_ioctx(io_context_type::uring);
+  REQUIRE(context != nullptr);
+  CHECK(context->type() == io_context_type::cufile_posix);
+  auto* front = dynamic_cast<cucascade::io::engine_ioctx*>(context.get());
+  REQUIRE(front != nullptr);
+  CHECK(front->engine().name() == "cufile_posix");
+
+  auto object = context->open_io_object("/proc/self/exe");
+  std::array<std::uint8_t, 4> magic{};
+  auto future = context->host_read_async_io(*object, 0, magic.size(), magic.data());
+  CHECK(std::move(future).get(std::chrono::seconds{30}) == magic.size());
+  CHECK(magic == std::array<std::uint8_t, 4>{0x7f, 'E', 'L', 'F'});
 }
 
 #ifdef CUCASCADE_HAS_CUFILE
