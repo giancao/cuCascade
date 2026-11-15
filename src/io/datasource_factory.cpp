@@ -19,7 +19,6 @@
 #include <cucascade/io/config.hpp>
 #ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
-#include <cucascade/io/cufile/cufile_reactor.hpp>
 #endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/engine_ioctx.hpp>
@@ -100,8 +99,7 @@ factory_type make_cufile_ioctx_factory()
 {
   return [](const io_config& config) -> std::shared_ptr<ioctx> {
     try {
-      auto ctx = std::make_shared<cufile::cufile_reactor::reactor_context>(config.cufile);
-      return std::make_shared<cufile::cufile_ioctx>(config.cufile_n_reactors, std::move(ctx));
+      return cufile::make_cufile_ioctx(config.cufile_n_reactors, config.cufile);
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_cufile_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -235,7 +233,7 @@ io_context_registry::io_context_registry(
 #ifdef CUCASCADE_HAS_CUFILE
   _entries.emplace(
     io_context_type::cufile,
-    entry{io_context_type::cufile, &cufile::cufile_reactor::supports, make_cufile_ioctx_factory()});
+    entry{io_context_type::cufile, &is_local_regular_file, make_cufile_ioctx_factory()});
 #endif
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,

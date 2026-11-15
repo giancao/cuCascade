@@ -176,9 +176,8 @@ class owned_engine_staging final : public kvikio::io::staging_source, private ow
   switch (backend) {
     case disk_io_backend::cufile: {
 #ifdef CUCASCADE_HAS_CUFILE
-      auto reactor_ctx = std::make_shared<io::cufile::cufile_reactor::reactor_context>(cfg.cufile);
-      return std::make_shared<io::cufile::cufile_ioctx>(cfg.cufile_n_reactors,
-                                                        std::move(reactor_ctx));
+      // A private engine, not the one selected for scans.
+      return io::cufile::make_private_cufile_ioctx(cfg.cufile_n_reactors, cfg.cufile);
 #else
       throw std::invalid_argument(
         "make_disk_io_context: the cufile backend was requested but this build has no cufile.h");

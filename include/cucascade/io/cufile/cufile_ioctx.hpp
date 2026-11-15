@@ -18,65 +18,50 @@
 
 #pragma once
 
+/**
+ * @file cufile_ioctx.hpp
+ * @brief The @c ioctx served by kvikIO's `cufile_reactor` engine.
+ */
+
+#include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/platform.hpp>
-#include <cucascade/io/templated_ioctx.hpp>
+#include <cucascade/io/engine_ioctx.hpp>
+
+#include <kvikio/io/cufile/cufile_engine.hpp>
 
 #include <cstddef>
 #include <memory>
-#include <string>
-#include <vector>
+#include <utility>
 
 namespace cucascade::io::cufile {
 
-// ---------------------------------------------------------------------------
-// cufile_ioctx
-// ---------------------------------------------------------------------------
-
 /**
- * @brief cuFile / GPUDirect Storage local-disk ioctx.  Thin specialisation of
- *        @c templated_ioctx<cufile_reactor>.
+ * @brief An @c engine_ioctx over the `cufile_reactor` engine: device
+ *        destinations through cuFile / GPUDirect Storage, the rest through POSIX.
  *
- * A pool of @c cufile_reactor s serves device reads with synchronous
- * @c cuFileRead (or, when cuFile cannot or should not serve them, POSIX reads
- * staged through each reactor's pinned scratch) and host reads with POSIX
- * @c pread; the pool shares one @c reactor_context (config only).  Writes
- * (@c open_io_object_for_write and the write API) use @c cuFileWrite for large
- * aligned device bodies on a real GDS platform and staged / direct @c pwrite
- * otherwise (see @c cufile_reactor).
- * Selected by @c io_backend::cufile and registered from the datasource factory
- * like the uring / rest backends.
+ * The engine cannot fill fragmented host buffers, so the prefetching cache is
+ * never armed on this context.
  *
- * Vectored reads (@c device_readv_async_io, @c host_device_readv_async_io and
- * the datasource's @c device_read_ranges_async on top of them) keep the generic
- * contract: the returned future settles only when every slice has stopped
- * touching its destination, failures and cancellations included, and a
- * successful device read is complete without further stream synchronization
- * (see @c cufile_reactor).
+ * Build one with @ref make_cufile_ioctx, which gets the engine by name from
+ * kvikIO's engine registry.
  */
-class cufile_ioctx : public templated_ioctx<cufile_reactor> {
+class cufile_ioctx : public engine_ioctx {
  public:
-  /// Build a pool of @p n_reactors reactors, all sharing @p ctx.  The ioctx
-  /// config is sourced from the reactors themselves -- see @c templated_ioctx.
-  cufile_ioctx(std::size_t n_reactors, std::shared_ptr<cufile_reactor::reactor_context> ctx);
+  /// Serve @p engine, which must be the `cufile_reactor` engine running @p cfg.
+  cufile_ioctx(std::shared_ptr<kvikio::io::engine> engine, config cfg)
+    : engine_ioctx(std::move(engine), io_context_type::cufile), _config(cfg)
+  {
+  }
 
-  [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::cufile; }
-
-  /**
-   * @brief Reactor selection tuned to synchronous reactors.
-   *
-   * A cuFile reactor serves one transfer at a time (synchronous cuFile and POSIX
-   * calls), so a request's queue depth is the number of reactors it is spread
-   * over.  A vectored read with more slices than the base's two gets every
-   * reactor, least backlogged first.  A host-only vectored write goes to one
-   * reactor: its page-cache writes with early writeback keep the device busy,
-   * and interleaving writers of one file only contends on its inode.  Other
-   * operations keep the base selection.
-   */
-  std::vector<cufile_reactor*> next_reactor(cufile_io_object const& object,
-                                            std::size_t n_slices,
-                                            io_op_type type,
-                                            int device_id = -1) override;
+  /// Build a pool of @p n_reactors reactors, all sharing @p ctx.  Creates the
+  /// engine directly, which needs the engine plugin at link time
+  /// (`kvikio::engine_cufile_reactor`); tests do that.
+  cufile_ioctx(std::size_t n_reactors, std::shared_ptr<cufile_reactor::reactor_context> const& ctx)
+    : cufile_ioctx(std::make_shared<kvikio::io::cufile::cufile_reactor_engine>(n_reactors, ctx),
+                   ctx->cfg())
+  {
+  }
 
   /**
    * @brief What GPUDirect Storage can do for reads of @p object, an object this
@@ -90,14 +75,30 @@ class cufile_ioctx : public templated_ioctx<cufile_reactor> {
    */
   [[nodiscard]] path_info path_capability(io_object const& object) const;
 
- protected:
-  /// Opens @p path with this ioctx's @c use_odirect / @c compat_mode, which the
-  /// static @c cufile_reactor::create_io_object(path) cannot see.
-  std::shared_ptr<io_object> create_io_object(std::string path) override;
+  /// The configuration the engine's reactors run with.
+  [[nodiscard]] config const& configuration() const noexcept { return _config; }
 
-  /// Opens @p path for writing with this ioctx's @c use_odirect / @c compat_mode.
-  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
-                                                        write_open_options options) override;
+ private:
+  config _config;
 };
+
+/**
+ * @brief Select kvikIO's `cufile_reactor` engine for local files, with
+ *        @p n_reactors reactors configured by @p cfg, and serve it.
+ *
+ * The engine is selected in kvikIO's process-wide registry, which loads its
+ * plugin, and is already started.
+ *
+ * @throws kvikio::io::engine_selection_error when the engine cannot be
+ *         selected: its plugin is missing, or it cannot be created with this
+ *         configuration.
+ */
+[[nodiscard]] std::shared_ptr<cufile_ioctx> make_cufile_ioctx(std::size_t n_reactors,
+                                                              config const& cfg);
+
+/// As @ref make_cufile_ioctx, with an engine of its own that is not selected
+/// in the registry: for a component that wants its own reactors.
+[[nodiscard]] std::shared_ptr<cufile_ioctx> make_private_cufile_ioctx(std::size_t n_reactors,
+                                                                      config const& cfg);
 
 }  // namespace cucascade::io::cufile
