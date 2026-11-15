@@ -22,6 +22,7 @@
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/object_identity.hpp>
 
+#include <kvikio/io/detail/file_descriptor.hpp>
 #include <kvikio/io/types.hpp>
 
 #include <cuda/stream>
@@ -59,34 +60,7 @@ namespace cucascade::io {
 using kvikio::io::IO_BLOCK_SIZE;
 using kvikio::io::write_granule;
 
-/**
- * @brief RAII wrapper for a POSIX file descriptor.
- *
- * Non-copyable, movable. Closes the underlying fd on destruction.
- */
-struct file_descriptor {
-  int fd{-1};
-  file_descriptor() = default;
-  explicit file_descriptor(int f) noexcept : fd(f) {}
-  ~file_descriptor() noexcept
-  {
-    if (fd >= 0) ::close(fd);
-  }
-  file_descriptor(file_descriptor const&)            = delete;
-  file_descriptor& operator=(file_descriptor const&) = delete;
-  file_descriptor(file_descriptor&& o) noexcept : fd(std::exchange(o.fd, -1)) {}
-  file_descriptor& operator=(file_descriptor&& o) noexcept
-  {
-    if (this != &o) {
-      if (fd >= 0) ::close(fd);
-      fd = std::exchange(o.fd, -1);
-    }
-    return *this;
-  }
-  [[nodiscard]] int get() const noexcept { return fd; }
-  [[nodiscard]] int native_handle() const noexcept { return fd; }
-  explicit operator bool() const noexcept { return fd >= 0; }
-};
+using kvikio::io::file_descriptor;
 
 // ---------------------------------------------------------------------------
 // Request vocabulary

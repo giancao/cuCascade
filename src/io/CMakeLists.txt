@@ -20,7 +20,6 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/engine_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/detail/local_descriptor.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/config.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/reactor_placement.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
