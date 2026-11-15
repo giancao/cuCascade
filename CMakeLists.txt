@@ -385,6 +385,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     target_compile_definitions(
       cucascade_io_thirdparty
       INTERFACE CUCASCADE_MOODYCAMEL_NAMESPACE=${CUCASCADE_MOODYCAMEL_NAMESPACE}
+                KVIKIO_MOODYCAMEL_NAMESPACE=${CUCASCADE_MOODYCAMEL_NAMESPACE}
     )
 
     # cucascade::exec::invocable backend. When abseil is requested, reuse a

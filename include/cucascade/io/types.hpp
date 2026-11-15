@@ -22,6 +22,7 @@
 #include <cucascade/io/byte_range.hpp>
 #include <cucascade/io/object_identity.hpp>
 
+#include <kvikio/io/detail/file_descriptor.hpp>
 #include <kvikio/io/types.hpp>
 
 #include <cuda/stream>
@@ -56,49 +57,10 @@ class ioctx;
 
 namespace cucascade::io {
 
-inline constexpr std::size_t IO_BLOCK_SIZE = 4096;
+using kvikio::io::IO_BLOCK_SIZE;
+using kvikio::io::write_granule;
 
-/// The granule writes are split at: @c max(IO_BLOCK_SIZE, page size).  The
-/// aligned body of a write goes O_DIRECT and its unaligned head / tail through
-/// the page cache; splitting at a page boundary keeps the two from ever sharing
-/// a page (64 KiB pages on some aarch64 systems).
-[[nodiscard]] inline std::size_t write_granule() noexcept
-{
-  static std::size_t const granule = [] {
-    auto const page = ::sysconf(_SC_PAGESIZE);
-    return page > 0 ? std::max(IO_BLOCK_SIZE, static_cast<std::size_t>(page)) : IO_BLOCK_SIZE;
-  }();
-  return granule;
-}
-
-/**
- * @brief RAII wrapper for a POSIX file descriptor.
- *
- * Non-copyable, movable. Closes the underlying fd on destruction.
- */
-struct file_descriptor {
-  int fd{-1};
-  file_descriptor() = default;
-  explicit file_descriptor(int f) noexcept : fd(f) {}
-  ~file_descriptor() noexcept
-  {
-    if (fd >= 0) ::close(fd);
-  }
-  file_descriptor(file_descriptor const&)            = delete;
-  file_descriptor& operator=(file_descriptor const&) = delete;
-  file_descriptor(file_descriptor&& o) noexcept : fd(std::exchange(o.fd, -1)) {}
-  file_descriptor& operator=(file_descriptor&& o) noexcept
-  {
-    if (this != &o) {
-      if (fd >= 0) ::close(fd);
-      fd = std::exchange(o.fd, -1);
-    }
-    return *this;
-  }
-  [[nodiscard]] int get() const noexcept { return fd; }
-  [[nodiscard]] int native_handle() const noexcept { return fd; }
-  explicit operator bool() const noexcept { return fd >= 0; }
-};
+using kvikio::io::file_descriptor;
 
 // ---------------------------------------------------------------------------
 // Request vocabulary

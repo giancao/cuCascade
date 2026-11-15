@@ -1802,7 +1802,7 @@ bool reactor_worker::start_copy(std::size_t index)
     return false;
   }
   auto const copy_status = copy.copy_async(op.op->io_rng, op.op->iovecs, event->get());
-  if (copy_status != cudaSuccess) {
+  if (copy_status != CUDA_SUCCESS) {
     // Part of the batch may be queued already: let it finish reading the staging first.
     try {
       rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};

@@ -105,26 +105,6 @@ std::string sha256_hex(std::string_view data)
   return hex_encode(md.data(), md.size());
 }
 
-std::string uri_encode(std::string_view s, bool encode_slash)
-{
-  static constexpr char kHexUpper[] = "0123456789ABCDEF";
-  std::string out;
-  out.reserve(s.size());
-  for (char raw : s) {
-    auto c          = static_cast<unsigned char>(raw);
-    bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-                      c == '-' || c == '_' || c == '.' || c == '~';
-    if (unreserved || (c == '/' && !encode_slash)) {
-      out.push_back(static_cast<char>(c));
-    } else {
-      out.push_back('%');
-      out.push_back(kHexUpper[(c >> 4) & 0xF]);
-      out.push_back(kHexUpper[c & 0xF]);
-    }
-  }
-  return out;
-}
-
 // ---------------------------------------------------------------------------
 // sign_request
 // ---------------------------------------------------------------------------

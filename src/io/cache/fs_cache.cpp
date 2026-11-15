@@ -302,7 +302,7 @@ struct fs_cache::cached_copy_retirement {
     if (status == cudaSuccess) {
       coordinator->on_complete();
     } else {
-      coordinator->report_error(status);
+      coordinator->report_error(to_driver_status(status));
     }
   }
 };

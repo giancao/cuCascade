@@ -1220,7 +1220,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
       if (device < 0) {
         auto const status = cudaGetDevice(&device);
         if (status != cudaSuccess) {
-          settle_slot_error(slot, status, true);
+          settle_slot_error(slot, to_driver_status(status), true);
           return;
         }
       }
@@ -1232,7 +1232,8 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
           slot.event_device = device;
         }
         auto const stream = copy.d_buffer.stream;
-        auto status       = copy.copy_async(slot.op->request.io_rng, slot.op->request.iovecs);
+        auto status =
+          to_runtime_status(copy.copy_async(slot.op->request.io_rng, slot.op->request.iovecs));
         if (status == cudaSuccess) status = record_copy_event(slot.copy_event->get(), stream);
         if (status != cudaSuccess) {
           // Some copies may already be queued on the caller's stream (copy_async
@@ -1241,7 +1242,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
           // the slot (and its staging) is released and the request settles.
           std::ignore = cudaStreamSynchronize(stream);
           std::ignore = cudaGetLastError();
-          settle_slot_error(slot, status, true);
+          settle_slot_error(slot, to_driver_status(status), true);
           return;
         }
         slot.state = slot_state::copying;
@@ -1278,7 +1279,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
           slot.op->request.finish_success();
           reset_slot(slot);
         } else {
-          settle_slot_error(slot, status, true);
+          settle_slot_error(slot, to_driver_status(status), true);
         }
       }
       copying.erase(output, copying.end());
@@ -1469,7 +1470,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
       if (device < 0) {
         auto const status = cudaGetDevice(&device);
         if (status != cudaSuccess) {
-          settle_slot_error(slot, status);
+          settle_slot_error(slot, to_driver_status(status));
           return;
         }
       }
@@ -1481,7 +1482,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         }
         auto const status = copy.copy_to_host_async(
           slot.op->request.io_rng, slot.op->request.iovecs, slot.copy_event->get());
-        if (status != cudaSuccess) {
+        if (status != CUDA_SUCCESS) {
           // Part of the copy may already be queued into the staging blocks: let
           // the stream pass it before the blocks go back to the pool.
           std::ignore = cudaStreamSynchronize(copy.d_buffer.stream);
@@ -1512,7 +1513,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         if (status == cudaSuccess) {
           prepare_staged_write(slot);
         } else {
-          settle_slot_error(slot, status);
+          settle_slot_error(slot, to_driver_status(status));
         }
       }
       staging.erase(output, staging.end());
@@ -1861,7 +1862,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token, std::promise<
         slot.op->request.finish_success();
         reset_slot(slot);
       } else {
-        settle_slot_error(slot, status, true);
+        settle_slot_error(slot, to_driver_status(status), true);
       }
     }
     copying.clear();
