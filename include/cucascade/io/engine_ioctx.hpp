@@ -65,8 +65,13 @@ class engine_ioctx : public ioctx {
 
   [[nodiscard]] io_context_type type() const noexcept override { return _type; }
 
-  /// The engine is started by whoever selected it; nothing to do here.
-  void start() override {}
+  /// Shuts the cache and the engine down, and stops selecting the engine in
+  /// kvikIO's registry if this context's creator selected it there.
+  ~engine_ioctx() override;
+
+  /// Starts the engine. One obtained from kvikIO's registry is already
+  /// started; starting an engine again does nothing.
+  void start() override { _engine->start(); }
 
   void shutdown() noexcept override { _engine->shutdown(); }
 

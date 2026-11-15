@@ -169,6 +169,9 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
 
   target_link_libraries(cucascade_io_tests PRIVATE cucascade_io Catch2::Catch2
                                                    CUDA::cudart_static)
+  # The uring tests drive the reactor classes directly, which live in kvikIO's
+  # io_uring engine plugin.
+  target_link_libraries(cucascade_io_tests PRIVATE kvikio::engine_uring)
 
   add_test(NAME cucascade_io_tests COMMAND cucascade_io_tests)
 endif()

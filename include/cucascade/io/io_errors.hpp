@@ -46,19 +46,7 @@ class credential_error : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
-/**
- * @brief Opening a local file paired descriptors of two different files.
- *
- * A local reactor opens a buffered descriptor and reopens it for @c O_DIRECT;
- * when the two do not name the same file (device and inode) on every attempt,
- * for example because the path is being replaced concurrently, the open fails
- * with this error rather than read the data of one file and the footer of
- * another.
- */
-class descriptor_mismatch_error : public std::runtime_error {
- public:
-  using std::runtime_error::runtime_error;
-};
+using kvikio::io::descriptor_mismatch_error;
 
 /**
  * @brief A read found the object to be a different version from the one its

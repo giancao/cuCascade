@@ -68,7 +68,7 @@ struct fixture {
            ("cucascade_uring_alloc_" + std::to_string(::getpid()) + ".bin")),
       mr{0, upstream, 128 * MiB, 128 * MiB, block_size, 64, 0},
       ctx{std::make_shared<uring_ioctx>(
-        1, std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr))}
+        1, cucascade::io::uring::make_reactor_context(cucascade::io::uring::config{}, &mr))}
   {
     std::vector<char> const bytes(file_bytes, 'x');
     std::ofstream out(path, std::ios::binary | std::ios::trunc);

@@ -18,35 +18,56 @@
 
 #pragma once
 
-#include <cucascade/io/templated_ioctx.hpp>
+/**
+ * @file uring_ioctx.hpp
+ * @brief The @c ioctx served by kvikIO's `uring` engine.
+ */
+
+#include <cucascade/io/engine_ioctx.hpp>
 #include <cucascade/io/uring/uring_reactor.hpp>
 
+#include <kvikio/io/uring/uring_engine.hpp>
+
+#include <cstddef>
+#include <memory>
+#include <utility>
 #include <vector>
 
 namespace cucascade::io::uring {
 
-// ---------------------------------------------------------------------------
-// uring_ioctx
-// ---------------------------------------------------------------------------
-
 /**
- * @brief io_uring-backed ioctx. Thin specialisation of
- *        @c templated_ioctx<uring_reactor>.
+ * @brief An @c engine_ioctx over the `uring` engine: local files through io_uring.
+ *
+ * cuCascade builds it from an engine it obtained by name from kvikIO's engine
+ * registry (see @c make_uring_ioctx_factory). Building it from a reactor
+ * context instead creates the engine directly, which needs the engine plugin
+ * at link time (`kvikio::engine_uring`); tests and benchmarks do that.
  */
-class uring_ioctx : public templated_ioctx<uring_reactor> {
+class uring_ioctx : public engine_ioctx {
  public:
-  /// Build a pool of @p n_reactors reactors, all sharing @p ctx (one context
-  /// per pool: it carries the per-reactor @c config and the pinned bounce-staging
-  /// resource, which must outlive this ioctx).  The ioctx config is sourced from
-  /// the reactors themselves — see @c templated_ioctx.
-  uring_ioctx(size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx);
+  /// Serve @p engine, which must be the `uring` engine.
+  explicit uring_ioctx(std::shared_ptr<kvikio::io::engine> engine)
+    : engine_ioctx(std::move(engine), io_context_type::uring)
+  {
+  }
 
-  [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::uring; }
+  /// Build a pool of @p n_reactors reactors, all sharing @p ctx (one context
+  /// per pool: it carries the per-reactor @c config and the staging source,
+  /// which must outlive this ioctx).  Links the engine plugin.
+  uring_ioctx(std::size_t n_reactors, std::shared_ptr<uring_reactor::reactor_context> ctx)
+    : uring_ioctx(std::make_shared<kvikio::io::uring::uring_engine>(n_reactors, std::move(ctx)))
+  {
+  }
 
   /// One gauge snapshot per reactor, in reactor order.  Each call restarts the
   /// reactors' max-inflight and queue-delay windows.  Nothing samples them in
   /// the background; callers that want them poll this.
-  [[nodiscard]] std::vector<uring_reactor::gauges> reactor_gauges() noexcept;
+  [[nodiscard]] std::vector<uring_reactor::gauges> reactor_gauges() noexcept
+  {
+    auto* diagnostics = dynamic_cast<kvikio::io::uring::uring_diagnostics*>(&engine());
+    return diagnostics == nullptr ? std::vector<uring_reactor::gauges>{}
+                                  : diagnostics->reactor_gauges();
+  }
 };
 
 }  // namespace cucascade::io::uring

@@ -309,7 +309,7 @@ int main(int argc, char** argv)
                                                              CHUNKS_PER_SLAB,  // pool_size
                                                              1);               // initial_pools
 
-  auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
+  auto uring_ctx = cucascade::io::uring::make_reactor_context(
     cucascade::io::uring::uring_reactor::reactor_config_type{.use_odirect = true}, &host_mr);
   std::shared_ptr<cucascade::io::ioctx> io_ctx =
     std::make_shared<cucascade::io::uring::uring_ioctx>(n_threads, std::move(uring_ctx));

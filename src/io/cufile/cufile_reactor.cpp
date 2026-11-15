@@ -27,11 +27,11 @@
 #include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_request.hpp>
+#include <cucascade/io/io_utils.hpp>
 #include <cucascade/io/object_identity.hpp>
 #include <cucascade/io/tiered_queue.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/types.hpp>
-#include <cucascade/io/uring/uring_reactor.hpp>
 #include <cucascade/log/logging.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -1029,8 +1029,13 @@ std::vector<byte_range> cufile_reactor::align_and_coalesce(
   std::span<byte_range const> ranges, std::optional<std::size_t> alignment) noexcept
 {
   // The alignment rule is the O_DIRECT one both local reactors share (page
-  // boundaries, then merge overlapping / adjacent ranges), so reuse it.
-  return uring::uring_reactor::align_and_coalesce(ranges, alignment);
+  // boundaries, then merge overlapping / adjacent ranges).
+  try {
+    auto const requested = alignment.value_or(IO_BLOCK_SIZE);
+    return io_utils::align_and_coalesce(ranges, std::max<std::size_t>(requested, IO_BLOCK_SIZE));
+  } catch (...) {
+    return {};
+  }
 }
 
 std::size_t cufile_reactor::host_read(cufile_io_object const& file,
