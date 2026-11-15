@@ -203,9 +203,15 @@ factory_type make_rest_ioctx_factory(
         return rest::make_rest_ioctx(
           config.rest_n_reactors, std::move(rest_cfg), config.object_store, staging);
       } catch (kvikio::io::engine_selection_error const& e) {
-        // The engine cannot be used in this process (its plugin is missing,
-        // io_uring is disabled, ...).  That is reported, and object stores are
-        // served by kvikIO's built-in curl engine instead of not at all.
+        // Fall back only when the engine does not exist in this process (its
+        // plugin could not be loaded).  When it exists but could not be created
+        // or started, the cause may pass (no descriptors left, ...): report no
+        // backend, as before, so the next lookup tries again instead of staying
+        // on the slower engine.
+        if (kvikio::io::engine_registry::instance().has_factory(
+              kvikio::io::rest::uring_http_engine_name)) {
+          throw;
+        }
         CUCASCADE_LOG_ERROR(
           "make_rest_ioctx_factory: {}; object stores are served by the curl engine", e.what());
         return rest::make_curl_rest_ioctx(config.object_store, std::move(staging));

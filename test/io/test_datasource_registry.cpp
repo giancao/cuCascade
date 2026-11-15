@@ -279,14 +279,12 @@ TEST_CASE("the uring context is served by kvikIO's uring engine plugin", "[io][r
     kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local).empty());
 }
 
-// The uring_http engine cannot be created (here: an explicit fan-out larger than the pool).
-// That is reported, and object stores are served by the built-in curl engine instead.
-TEST_CASE("a REST context that cannot be created falls back to the curl engine",
+// The uring_http engine exists but cannot be created (here: an explicit fan-out larger than the
+// pool). That may be transient, so there is no backend rather than a fallback to the curl
+// engine; the fallback is for a process in which the engine's plugin cannot be loaded at all.
+TEST_CASE("a REST context that cannot be created is not replaced by the curl engine",
           "[io][registry][rest][curl]")
 {
-  auto const payload = cucascade::test::rest_test_payload(64 * 1024);
-  cucascade::test::loopback_range_server server{payload};
-
   cucascade::memory::reservation_manager_configurator builder;
   builder.set_number_of_gpus(1)
     .set_gpu_usage_limit(1ULL << 30)
@@ -294,7 +292,7 @@ TEST_CASE("a REST context that cannot be created falls back to the curl engine",
     .use_gpu_id_as_host_id();
   memory_reservation_manager manager{builder.build()};
   io_config config{};
-  config.object_store.endpoint   = server.endpoint();
+  config.object_store.endpoint   = "http://127.0.0.1:9";
   config.object_store.region     = "us-east-1";
   config.object_store.access_key = "test-access-key";
   config.object_store.secret_key = "test-secret-key";
@@ -302,20 +300,10 @@ TEST_CASE("a REST context that cannot be created falls back to the curl engine",
   config.rest.fan_out            = 64;
   io_context_registry registry{config, manager};
 
-  auto context = registry.make_ioctx(io_context_type::restful);
-  REQUIRE(context != nullptr);
-  CHECK(context->type() == io_context_type::restful);
-  auto* rest = dynamic_cast<cucascade::io::rest::rest_ioctx*>(context.get());
-  REQUIRE(rest != nullptr);
-  CHECK(rest->engine().name() == "curl");
-  CHECK_FALSE(rest->has_transport_api());
-
-  auto object = context->open_io_object("s3://bucket/object.bin");
-  CHECK(object->size() == payload.size());
-  std::vector<std::uint8_t> bytes(4096);
-  auto future = context->host_read_async_io(*object, 100, bytes.size(), bytes.data());
-  CHECK(std::move(future).get(std::chrono::seconds{30}) == bytes.size());
-  CHECK(std::equal(bytes.begin(), bytes.end(), payload.begin() + 100));
+  CHECK(registry.make_ioctx(io_context_type::restful) == nullptr);
+  CHECK(kvikio::io::engine_registry::instance().has_factory("uring_http"));
+  CHECK(
+    kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::s3).empty());
 }
 
 // What a kvikIO engine logs reaches cuCascade's sink: here the registry's report of a
