@@ -126,8 +126,9 @@ std::unique_ptr<representation_converter_registry> make_benchmark_registry()
 constexpr int hostDevId = -1;
 
 /// DISK memory space ids; every disk benchmark takes one as its last argument.
-constexpr int DEFAULT_DISK_ID = 0;  ///< default io context (uring on hosts without GDS)
-constexpr int CUFILE_DISK_ID  = 1;  ///< forced cuFile io context
+constexpr int DEFAULT_DISK_ID      = 0;  ///< default io context (uring on hosts without GDS)
+constexpr int CUFILE_DISK_ID       = 1;  ///< forced cuFile io context
+constexpr int CUFILE_POSIX_DISK_ID = 2;  ///< kvikIO's built-in cufile_posix engine
 
 /// Directory the DISK spaces create their files in: $CUCASCADE_BENCH_DISK_DIR, else /tmp.
 std::string benchmark_disk_dir()
@@ -179,6 +180,14 @@ std::vector<memory_space_config> create_benchmark_configs()
   cufile_options.backend = disk_io_backend::cufile;
   cufile_disk.io_context = make_disk_io_context(cufile_options);
   configs.emplace_back(cufile_disk);
+
+  // DISK 2: kvikIO's built-in engine (cuFile where the system supports it, POSIX otherwise).
+  disk_memory_space_config posix_disk = default_disk;
+  posix_disk.disk_id                  = CUFILE_POSIX_DISK_ID;
+  disk_io_context_options posix_options;
+  posix_options.backend = disk_io_backend::cufile_posix;
+  posix_disk.io_context = make_disk_io_context(posix_options);
+  configs.emplace_back(posix_disk);
 
   return configs;
 }
@@ -788,7 +797,9 @@ void BM_ConvertGpuToDiskStructColumns(benchmark::State& state)
 BENCHMARK(BM_ConvertGpuToDisk)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB}, {4}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB},
+                 {4},
+                 {DEFAULT_DISK_ID, CUFILE_DISK_ID, CUFILE_POSIX_DISK_ID}})
   ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
@@ -796,7 +807,9 @@ BENCHMARK(BM_ConvertGpuToDisk)
 BENCHMARK(BM_ConvertDiskToGpu)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB}, {4}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB},
+                 {4},
+                 {DEFAULT_DISK_ID, CUFILE_DISK_ID, CUFILE_POSIX_DISK_ID}})
   ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
@@ -805,7 +818,9 @@ BENCHMARK(BM_ConvertDiskToGpu)
 BENCHMARK(BM_ConvertHostToDisk)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB}, {4}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB},
+                 {4},
+                 {DEFAULT_DISK_ID, CUFILE_DISK_ID, CUFILE_POSIX_DISK_ID}})
   ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
@@ -813,7 +828,9 @@ BENCHMARK(BM_ConvertHostToDisk)
 BENCHMARK(BM_ConvertDiskToHost)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB}, {4}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgsProduct({{1 * MiB, 64 * MiB, 512 * MiB, 4 * GiB},
+                 {4},
+                 {DEFAULT_DISK_ID, CUFILE_DISK_ID, CUFILE_POSIX_DISK_ID}})
   ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
@@ -822,7 +839,7 @@ BENCHMARK(BM_ConvertDiskToHost)
 BENCHMARK(BM_ConvertGpuToDiskStringColumns)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->ArgsProduct({{64 * MiB}, {2, 4, 8}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgsProduct({{64 * MiB}, {2, 4, 8}, {DEFAULT_DISK_ID, CUFILE_DISK_ID, CUFILE_POSIX_DISK_ID}})
   ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
@@ -830,7 +847,7 @@ BENCHMARK(BM_ConvertGpuToDiskStringColumns)
 BENCHMARK(BM_ConvertGpuToDiskListColumns)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->ArgsProduct({{64 * MiB}, {2, 4, 8}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgsProduct({{64 * MiB}, {2, 4, 8}, {DEFAULT_DISK_ID, CUFILE_DISK_ID, CUFILE_POSIX_DISK_ID}})
   ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
@@ -838,7 +855,7 @@ BENCHMARK(BM_ConvertGpuToDiskListColumns)
 BENCHMARK(BM_ConvertGpuToDiskStructColumns)
   ->Setup(DoSetup)
   ->Teardown(DoTeardown)
-  ->ArgsProduct({{64 * MiB}, {2, 4, 8}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}})
+  ->ArgsProduct({{64 * MiB}, {2, 4, 8}, {DEFAULT_DISK_ID, CUFILE_DISK_ID, CUFILE_POSIX_DISK_ID}})
   ->ArgNames({"bytes", "columns", "disk"})
   ->Unit(benchmark::kMillisecond)
   ->UseRealTime();
@@ -972,12 +989,14 @@ void BM_WriteStruct(benchmark::State& s) { disk_write_benchmark(s, create_struct
 void BM_ReadStruct(benchmark::State& s) { disk_read_benchmark(s, create_struct_benchmark_table); }
 
 // Size sweep args for type comparison
-#define DISK_BACKEND_ARGS                                                                   \
-  ->Setup(DoSetup)                                                                          \
-    ->Teardown(DoTeardown)                                                                  \
-    ->ArgsProduct({{64 * MiB, 512 * MiB, 4 * GiB}, {4}, {DEFAULT_DISK_ID, CUFILE_DISK_ID}}) \
-    ->ArgNames({"bytes", "columns", "disk"})                                                \
-    ->Unit(benchmark::kMillisecond)                                                         \
+#define DISK_BACKEND_ARGS                                                    \
+  ->Setup(DoSetup)                                                           \
+    ->Teardown(DoTeardown)                                                   \
+    ->ArgsProduct({{64 * MiB, 512 * MiB, 4 * GiB},                           \
+                   {4},                                                      \
+                   {DEFAULT_DISK_ID, CUFILE_DISK_ID, CUFILE_POSIX_DISK_ID}}) \
+    ->ArgNames({"bytes", "columns", "disk"})                                 \
+    ->Unit(benchmark::kMillisecond)                                          \
     ->UseRealTime()
 
 BENCHMARK(BM_WriteNumeric) DISK_BACKEND_ARGS;
