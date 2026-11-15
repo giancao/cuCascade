@@ -170,6 +170,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
 
   target_link_libraries(cucascade_io_tests PRIVATE cucascade_io Catch2::Catch2
                                                    CUDA::cudart_static)
+  # The tests of the REST layers use OpenSSL (TLS servers and PKI) and liburing
+  # directly; the io library no longer brings them.
+  target_link_libraries(cucascade_io_tests PRIVATE PkgConfig::LIBURING
+                                                   OpenSSL::SSL OpenSSL::Crypto)
   # The uring tests drive the reactor classes directly, which live in kvikIO's
   # io_uring engine plugin.
   target_link_libraries(cucascade_io_tests PRIVATE kvikio::engine_uring
@@ -239,6 +243,13 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     cucascade_cudf_tests
     PRIVATE cucascade_cudf Catch2::Catch2 CUDA::cudart_static
             cudf::cudftest_default_stream)
+  if(CUCASCADE_BUILD_IO)
+    # test/utils/disk_test_utils.hpp probes io_uring with liburing; the loopback
+    # object-store server of the datasource tests uses OpenSSL.
+    target_link_libraries(
+      cucascade_cudf_tests PRIVATE PkgConfig::LIBURING OpenSSL::SSL
+                                   OpenSSL::Crypto)
+  endif()
   # test_cache_object_identity builds a REST context from its own reactor
   # context, which creates kvikIO's uring_http engine directly.
   if(TARGET kvikio_engine_uring_http)
