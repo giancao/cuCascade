@@ -377,9 +377,11 @@ TEST_CASE("engine logs are forwarded to the cuCascade sink", "[io][registry][log
   CHECK(seen);
 }
 
-// The uring engine cannot be created (here: no reactors). That is reported, and
-// local files are served by the built-in engine rather than not at all.
-TEST_CASE("a uring context that cannot be created falls back to cufile_posix",
+// The uring engine exists and io_uring works, but the engine cannot be created (here: no
+// reactors). That is a configuration error, so there is no backend rather than a fallback to
+// cufile_posix; the fallback is for a process in which the engine's plugin cannot be loaded or
+// io_uring is not allowed.
+TEST_CASE("a uring context that cannot be created is not replaced by cufile_posix",
           "[io][registry][uring]")
 {
   cucascade::memory::reservation_manager_configurator builder;
@@ -389,21 +391,22 @@ TEST_CASE("a uring context that cannot be created falls back to cufile_posix",
     .use_gpu_id_as_host_id();
   memory_reservation_manager manager{builder.build()};
   io_config config{};
-  config.uring_n_reactors = 0;
+  config.uring_n_reactors = 1;
   io_context_registry registry{config, manager};
+  {
+    auto usable = registry.make_ioctx(io_context_type::uring);
+    REQUIRE(usable != nullptr);
+    if (usable->type() != io_context_type::uring) {
+      SKIP("io_uring is not usable in this process; every uring context falls back");
+    }
+  }
 
-  auto context = registry.make_ioctx(io_context_type::uring);
-  REQUIRE(context != nullptr);
-  CHECK(context->type() == io_context_type::cufile_posix);
-  auto* front = dynamic_cast<cucascade::io::engine_ioctx*>(context.get());
-  REQUIRE(front != nullptr);
-  CHECK(front->engine().name() == "cufile_posix");
-
-  auto object = context->open_io_object("/proc/self/exe");
-  std::array<std::uint8_t, 4> magic{};
-  auto future = context->host_read_async_io(*object, 0, magic.size(), magic.data());
-  CHECK(std::move(future).get(std::chrono::seconds{30}) == magic.size());
-  CHECK(magic == std::array<std::uint8_t, 4>{0x7f, 'E', 'L', 'F'});
+  config.uring_n_reactors = 0;
+  io_context_registry broken{config, manager};
+  CHECK(broken.make_ioctx(io_context_type::uring) == nullptr);
+  CHECK(kvikio::io::engine_registry::instance().has_factory("uring"));
+  CHECK(
+    kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local).empty());
 }
 
 #ifdef CUCASCADE_HAS_CUFILE
