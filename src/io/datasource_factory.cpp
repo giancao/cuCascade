@@ -196,8 +196,20 @@ factory_type make_rest_ioctx_factory(
       // s3_signing_mode names) and is selected by name in kvikIO's registry.
       std::shared_ptr<kvikio::io::staging_source> staging;
       if (host_mr != nullptr) { staging = std::make_shared<host_staging_source>(*host_mr); }
-      return rest::make_rest_ioctx(
-        config.rest_n_reactors, std::move(rest_cfg), config.object_store, std::move(staging));
+      // A configuration that is invalid on its face disables the backend, as it
+      // always did; only an engine that cannot be used falls back below.
+      rest_cfg.validate();
+      try {
+        return rest::make_rest_ioctx(
+          config.rest_n_reactors, std::move(rest_cfg), config.object_store, staging);
+      } catch (kvikio::io::engine_selection_error const& e) {
+        // The engine cannot be used in this process (its plugin is missing,
+        // io_uring is disabled, ...).  That is reported, and object stores are
+        // served by kvikIO's built-in curl engine instead of not at all.
+        CUCASCADE_LOG_ERROR(
+          "make_rest_ioctx_factory: {}; object stores are served by the curl engine", e.what());
+        return rest::make_curl_rest_ioctx(config.object_store, std::move(staging));
+      }
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_rest_ioctx_factory: construction failed: {}", e.what());
       return nullptr;

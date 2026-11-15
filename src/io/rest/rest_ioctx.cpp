@@ -19,6 +19,7 @@
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/memory/net_topology.hpp>
 
+#include <kvikio/io/curl_engine.hpp>
 #include <kvikio/io/engine_registry.hpp>
 #include <kvikio/io/rest/placement.hpp>
 
@@ -50,8 +51,7 @@ std::optional<kvikio::io::nic_topology> discover_egress_nic(std::string_view int
     nic.node_cpus   = found->node_cpus;
     nic.queue_irqs.reserve(found->queue_irqs.size());
     for (auto const& q : found->queue_irqs) {
-      nic.queue_irqs.push_back(
-        kvikio::io::nic_queue_irq{q.irq, q.queue, q.cpus, q.requested_cpus});
+      nic.queue_irqs.push_back(kvikio::io::nic_queue_irq{q.irq, q.queue, q.cpus, q.requested_cpus});
     }
     return nic;
   } catch (...) {
@@ -61,10 +61,11 @@ std::optional<kvikio::io::nic_topology> discover_egress_nic(std::string_view int
 
 rest_ioctx::rest_ioctx(std::shared_ptr<kvikio::io::engine> engine)
   : engine_ioctx(std::move(engine), io_context_type::restful),
+    _listing(dynamic_cast<kvikio::io::object_listing*>(&this->engine())),
     _api(dynamic_cast<kvikio::io::rest::uring_http_api*>(&this->engine()))
 {
-  if (_api == nullptr) {
-    throw std::invalid_argument("rest_ioctx: the engine is not the uring_http engine");
+  if (_listing == nullptr) {
+    throw std::invalid_argument("rest_ioctx: the engine does not list objects");
   }
 }
 
@@ -81,6 +82,17 @@ std::shared_ptr<rest_ioctx> make_rest_ioctx(std::size_t n_reactors,
   options.staging      = std::move(staging);
   auto engine          = kvikio::io::engine_registry::instance().select(
     kvikio::io::engine_route::s3, kvikio::io::rest::uring_http_engine_name, options);
+  return std::make_shared<rest_ioctx>(std::move(engine));
+}
+
+std::shared_ptr<rest_ioctx> make_curl_rest_ioctx(
+  object_store_config const& object_store, std::shared_ptr<kvikio::io::staging_source> staging)
+{
+  kvikio::io::curl_options options;
+  options.object_store = object_store;
+  options.staging      = std::move(staging);
+  auto engine          = kvikio::io::engine_registry::instance().select(
+    kvikio::io::engine_route::s3, kvikio::io::curl_engine_name, options);
   return std::make_shared<rest_ioctx>(std::move(engine));
 }
 
