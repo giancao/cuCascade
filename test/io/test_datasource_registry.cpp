@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "log/log_test_utils.hpp"
+
 #include <cucascade/io/config.hpp>
 #ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_reactor.hpp>
@@ -272,6 +274,26 @@ TEST_CASE("the uring context is served by kvikIO's uring engine plugin", "[io][r
   context.reset();
   CHECK(
     kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local).empty());
+}
+
+// What a kvikIO engine logs reaches cuCascade's sink: here the registry's report of a
+// failed selection, which kvikIO logs as an error.
+TEST_CASE("engine logs are forwarded to the cuCascade sink", "[io][registry][log]")
+{
+  if (std::getenv("KVIKIO_LOG_LEVEL") != nullptr) {
+    SKIP("KVIKIO_LOG_LEVEL is set: kvikIO's logger is left to the user");
+  }
+  auto recorded = std::make_shared<cucascade::test::recording_sink>();
+  cucascade::test::scoped_sink const installed{recorded, cucascade::log::level::warn};
+  cucascade::io::forward_engine_logs();
+
+  CHECK_THROWS_AS(kvikio::io::engine_registry::instance().create("no_such_engine"),
+                  kvikio::io::engine_selection_error);
+  bool seen = false;
+  for (auto const& message : recorded->messages()) {
+    if (message.find("cannot create engine 'no_such_engine'") != std::string::npos) { seen = true; }
+  }
+  CHECK(seen);
 }
 
 // The uring engine cannot be created (here: no reactors). That is reported, and

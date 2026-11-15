@@ -39,6 +39,20 @@
 namespace cucascade::io {
 
 /**
+ * @brief Send what the kvikIO engines log to cuCascade's log sink.
+ *
+ * The engines log through kvikIO's logger, which is off unless
+ * `KVIKIO_LOG_LEVEL` is set. This attaches a sink to it that hands every
+ * record to cuCascade's sink, and sets its level to cuCascade's current
+ * threshold (@c log::get_min_level), so a host sees the engines' warnings and
+ * errors where it sees cuCascade's. Called whenever an @ref engine_ioctx is
+ * built; call it again after changing cuCascade's threshold to carry the new
+ * level over. When `KVIKIO_LOG_LEVEL` is set, kvikIO's logger is left as the
+ * user configured it and nothing is forwarded.
+ */
+void forward_engine_logs() noexcept;
+
+/**
  * @brief The cache-aware front end of one kvikIO engine.
  *
  * The @c ioctx base keeps what belongs to cuCascade: the @c fs_cache, the

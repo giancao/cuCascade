@@ -18,23 +18,69 @@
 
 #include <cucascade/io/engine_ioctx.hpp>
 #include <cucascade/io/host_staging_source.hpp>
+#include <cucascade/log/logging.hpp>
 
 #include <kvikio/io/engine_registry.hpp>
+#include <kvikio/logger.hpp>
 
 #include <rmm/error.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <source_location>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace cucascade::io {
+
+namespace {
+
+/// kvikIO's logger calls this for every record it lets through.
+void deliver_engine_record(int lvl, char const* message)
+{
+  if (message == nullptr) { return; }
+  std::string_view text{message};
+  while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+    text.remove_suffix(1);
+  }
+  // rapids_logger's levels are numbered like cuCascade's (trace = 0 ... off = 6).
+  auto const level =
+    static_cast<log::level>(std::clamp(lvl, 0, static_cast<int>(log::level::fatal)));
+  log::detail::deliver(level, std::source_location::current(), text);
+}
+
+}  // namespace
+
+void forward_engine_logs() noexcept
+{
+  try {
+    // The user asked for kvikIO's own logging: leave it alone.
+    if (std::getenv("KVIKIO_LOG_LEVEL") != nullptr) { return; }
+    auto& logger = kvikio::default_logger();
+    static std::once_flag attached;
+    std::call_once(attached, [&logger] {
+      // cuCascade's sink adds the timestamp and level itself.
+      logger.set_pattern("%v");
+      logger.sinks().push_back(
+        std::make_shared<rapids_logger::callback_sink_mt>(&deliver_engine_record));
+    });
+    logger.set_level(static_cast<rapids_logger::level_enum>(
+      std::min(static_cast<int>(log::get_min_level()), static_cast<int>(log::level::off))));
+  } catch (...) {
+    // Logging never fails the caller.
+  }
+}
 
 engine_ioctx::engine_ioctx(std::shared_ptr<kvikio::io::engine> engine, io_context_type type)
   : _engine(std::move(engine)), _type(type)
 {
   if (_engine == nullptr) { throw std::invalid_argument("engine_ioctx: the engine is null"); }
+  forward_engine_logs();
   _caps = _engine->capabilities();
 }
 
