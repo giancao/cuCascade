@@ -591,6 +591,18 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   endif()
 endif()
 
+# Make @p target build kvikIO's engine plugins. A dependency on the io object
+# library would not do: for an object library it only orders compilation, and
+# the plugins would not be linked unless something else asked for them.
+function(cucascade_io_depends_on_engines target)
+  foreach(_engine kvikio_engine_uring kvikio_engine_cufile_reactor
+                  kvikio_engine_uring_http)
+    if(TARGET ${_engine})
+      add_dependencies(${target} ${_engine})
+    endif()
+  endforeach()
+endfunction()
+
 if(CUCASCADE_BUILD_IO)
   # Link libraries shared by the io object library and the installable io
   # targets: only kvikIO, whose engine plugins carry liburing and OpenSSL.
@@ -602,17 +614,10 @@ if(CUCASCADE_BUILD_IO)
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}
                                 cucascade_io_thirdparty)
-  # cuCascade loads the io_uring engine by name at run time, so nothing links
-  # it; this makes sure it is built whenever the io library is.
-  if(TARGET kvikio_engine_uring)
-    add_dependencies(cucascade_io_objects kvikio_engine_uring)
-  endif()
-  if(TARGET kvikio_engine_cufile_reactor)
-    add_dependencies(cucascade_io_objects kvikio_engine_cufile_reactor)
-  endif()
-  if(TARGET kvikio_engine_uring_http)
-    add_dependencies(cucascade_io_objects kvikio_engine_uring_http)
-  endif()
+  # cuCascade loads the engines by name at run time, so nothing links them. The
+  # io libraries depend on the plugin targets instead (see
+  # cucascade_io_depends_on_engines below), so that a build of just the io
+  # library, or of a host that links it, builds the plugins too.
   target_include_directories(cucascade_io_objects
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_definitions(cucascade_io_objects
@@ -731,6 +736,7 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
       set_target_properties(
         cucascade_io_static PROPERTIES OUTPUT_NAME cucascade_io
                                        EXPORT_NAME cucascade_io_static)
+      cucascade_io_depends_on_engines(cucascade_io_static)
     endif()
   endif()
 endif()
@@ -812,6 +818,7 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
 
       set_target_properties(cucascade_io_shared PROPERTIES OUTPUT_NAME
                                                            cucascade_io)
+      cucascade_io_depends_on_engines(cucascade_io_shared)
     endif()
   endif()
 endif()
