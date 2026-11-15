@@ -214,6 +214,7 @@ function(cucascade_add_kvikio)
   # The io_uring engine is a kvikIO plugin (libkvikio_engine_uring.so, next to
   # libkvikio.so). It uses the same moodycamel copy as cuCascade.
   set(KvikIO_BUILD_URING_ENGINE ON)
+  set(KvikIO_BUILD_CUFILE_REACTOR_ENGINE ON)
   set(KvikIO_MOODYCAMEL_TARGET "${CUCASCADE_MOODYCAMEL_TARGET}")
   set(KvikIO_MOODYCAMEL_INCLUDE_DIR "${CUCASCADE_MOODYCAMEL_INCLUDE_DIR}")
   set(KvikIO_MOODYCAMEL_NAMESPACE "${CUCASCADE_MOODYCAMEL_NAMESPACE}")
@@ -600,6 +601,9 @@ if(CUCASCADE_BUILD_IO)
   # this makes sure it is built whenever the io library is.
   if(TARGET kvikio_engine_uring)
     add_dependencies(cucascade_io_objects kvikio_engine_uring)
+  endif()
+  if(TARGET kvikio_engine_cufile_reactor)
+    add_dependencies(cucascade_io_objects kvikio_engine_cufile_reactor)
   endif()
   target_include_directories(cucascade_io_objects
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})

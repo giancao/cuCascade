@@ -16,12 +16,13 @@
  * limitations under the License.
  */
 
-#include <cucascade/io/cufile/cufile_api.hpp>
-#include <cucascade/io/cufile/cufile_reactor.hpp>
 #include <cucascade/io/cufile/detail.hpp>
 #include <cucascade/io/cufile/platform.hpp>
 #include <cucascade/log/logging.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
+
+#include <kvikio/io/cufile/cufile_options.hpp>
+#include <kvikio/io/engine_registry.hpp>
 
 #include <cufile.h>
 
@@ -36,90 +37,6 @@
 #include <utility>
 
 namespace cucascade::io::cufile {
-
-namespace detail {
-
-bool force_compat_env_on(char const* value) noexcept
-{
-  if (value == nullptr) { return false; }
-  constexpr char upper[] = "TRUE";
-  for (int i = 0; i < 4; ++i) {
-    // A null terminator cannot match a letter, so short values stop here.
-    if (value[i] != upper[i] && value[i] != upper[i] + ('a' - 'A')) { return false; }
-  }
-  return true;
-}
-
-}  // namespace detail
-
-namespace {
-
-[[nodiscard]] platform_info compute_platform() noexcept
-{
-  platform_info info{};
-  info.forced_compat = detail::force_compat_env_on(std::getenv("CUFILE_FORCE_COMPAT_MODE"));
-  try {
-    auto const* api        = cufile_api::get();
-    info.library_available = api != nullptr;
-    if (!info.library_available) return info;
-    info.version = cufile_api::version();
-    if (!cufile_api::open_driver()) return info;
-    info.driver_opened = true;
-    CUfileDrvProps_t props{};
-    if (api->driver_get_properties(&props).err != CU_FILE_SUCCESS) {
-      CUCASCADE_LOG_WARN("cufile: cuFileDriverGetProperties failed; the GDS mode is unknown");
-      return info;
-    }
-    info.properties_available  = true;
-    info.dstatusflags          = props.nvfs.dstatusflags;
-    info.compat_only           = info.dstatusflags == 0;
-    info.max_direct_io_size_kb = props.nvfs.max_direct_io_size;
-  } catch (std::exception const& e) {
-    CUCASCADE_LOG_WARN("cufile: probing the cuFile library failed: {}", e.what());
-  } catch (...) {
-    CUCASCADE_LOG_WARN("cufile: probing the cuFile library failed with an unknown error");
-  }
-  return info;
-}
-
-}  // namespace
-
-platform_info const& probe_platform() noexcept
-{
-  static platform_info const info = [] {
-    auto result = compute_platform();
-    if (!result.driver_opened) {
-      CUCASCADE_LOG_INFO("cufile: cuFile unavailable (library {}, driver not opened)",
-                         result.library_available ? "loaded" : "missing");
-    } else if (!result.properties_available) {
-      CUCASCADE_LOG_INFO("cufile: cuFile {} driver opened, but its mode is unknown",
-                         result.version);
-    } else if (result.compat_only || result.forced_compat) {
-      CUCASCADE_LOG_INFO(
-        "cufile: cuFile {} runs in COMPATIBILITY mode ({}): reads bounce through host memory "
-        "inside cuFile",
-        result.version,
-        result.forced_compat ? "forced by the environment" : "no storage class reports GDS");
-    } else {
-      CUCASCADE_LOG_INFO("cufile: cuFile {} reports GPUDirect Storage (dstatusflags {:#x})",
-                         result.version,
-                         result.dstatusflags);
-    }
-    return result;
-  }();
-  return info;
-}
-
-bool gds_available() noexcept
-{
-  auto const& info = probe_platform();
-  return info.driver_opened && info.properties_available && !info.compat_only &&
-         !info.forced_compat;
-}
-
-// ---------------------------------------------------------------------------
-// per-path capability
-// ---------------------------------------------------------------------------
 
 namespace {
 
@@ -223,13 +140,15 @@ void fill_policy(path_info& info, config const& cfg)
   info.platform    = probe_platform();
 }
 
-void fill_from_object(path_info& info, cufile_io_object const& object)
+void fill_from_object(path_info& info,
+                      io_object const& object,
+                      kvikio::io::cufile::cufile_object_view const& view)
 {
-  info.storage = memory::topology_discovery::discover_storage_for_descriptor(object.buffered_fd(),
+  info.storage     = memory::topology_discovery::discover_storage_for_descriptor(view.buffered_fd(),
                                                                              object.object_path());
-  info.opened  = true;
-  info.direct_open = object.direct_fd() >= 0;
-  info.registered  = object.cufile_registered();
+  info.opened      = true;
+  info.direct_open = view.direct_fd() >= 0;
+  info.registered  = view.cufile_registered();
 }
 
 }  // namespace
@@ -395,12 +314,14 @@ void decide_path_capability(path_info& info) noexcept
 
 }  // namespace detail
 
-path_info probe_object(cufile_io_object const& object, config const& cfg) noexcept
+path_info probe_object(io_object const& object,
+                       kvikio::io::cufile::cufile_object_view const& view,
+                       config const& cfg) noexcept
 {
   path_info info;
   try {
     fill_policy(info, cfg);
-    fill_from_object(info, object);
+    fill_from_object(info, object, view);
     detail::decide_path_capability(info);
     log_once(info);
   } catch (...) {
@@ -415,19 +336,30 @@ path_info probe_path(std::string const& path, config const& cfg) noexcept
   path_info info;
   try {
     fill_policy(info, cfg);
-    std::unique_ptr<cufile_io_object> object;
+    // The file is opened the way the engine opens it, by a short-lived engine
+    // of its own: the reactor lives in kvikIO's plugin, which is loaded by name.
+    std::shared_ptr<io_object> object;
+    std::shared_ptr<kvikio::io::engine> engine;
     try {
-      object = cufile_reactor::create_io_object(path, cfg.use_odirect, cfg.compat_mode);
+      kvikio::io::cufile::cufile_reactor_options options;
+      options.n_reactors = 1;
+      options.cfg        = cfg;
+      engine             = kvikio::io::engine_registry::instance().create(
+        kvikio::io::cufile::cufile_reactor_engine_name, options);
+      object = engine->open(path, open_options{});
     } catch (std::exception const& e) {
       info.open_error = e.what();
     } catch (...) {
       info.open_error = "unknown error";
     }
-    if (object != nullptr) {
-      fill_from_object(info, *object);
+    auto const* view = dynamic_cast<kvikio::io::cufile::cufile_object_view const*>(object.get());
+    if (view != nullptr) {
+      fill_from_object(info, *object, *view);
     } else {
       info.storage = memory::topology_discovery::discover_storage_for_path(path);
     }
+    object.reset();
+    if (engine != nullptr) { engine->shutdown(); }
     detail::decide_path_capability(info);
     log_once(info);
   } catch (...) {

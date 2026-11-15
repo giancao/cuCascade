@@ -172,6 +172,10 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   # The uring tests drive the reactor classes directly, which live in kvikIO's
   # io_uring engine plugin.
   target_link_libraries(cucascade_io_tests PRIVATE kvikio::engine_uring)
+  if(TARGET kvikio_engine_cufile_reactor)
+    target_link_libraries(cucascade_io_tests
+                          PRIVATE kvikio::engine_cufile_reactor)
+  endif()
 
   add_test(NAME cucascade_io_tests COMMAND cucascade_io_tests)
 endif()
