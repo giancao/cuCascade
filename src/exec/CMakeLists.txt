@@ -15,5 +15,5 @@
 # the License.
 # =============================================================================
 
-target_sources(
-  cucascade_io_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/thread_util.cpp)
+# The exec sources (admission_control, thread_util) moved to kvikIO; the headers
+# under include/cucascade/exec re-export them. Nothing is compiled here.
