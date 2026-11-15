@@ -22,8 +22,11 @@
 #include "loopback_range_server.hpp"
 #include "rest_contract_test_utils.hpp"
 
+#include <cucascade/io/engine_ioctx.hpp>
 #include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/object_listing.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 
 #include <kvikio/io/engine_registry.hpp>
 
@@ -90,6 +93,19 @@ TEST_CASE("the curl engine serves a REST context: open, read and list", "[rest][
   CHECK(entries[0].key == "data/part.0.parquet");
   CHECK(entries[1].size == 200);
   CHECK(server.list_count() >= 1);
+
+  // A host that only holds an ioctx lists through the engine's listing interface, whichever
+  // engine serves the context; an interface the engine lacks is absent.  The interface shares
+  // ownership of the context.
+  {
+    std::shared_ptr<cucascade::io::ioctx> const as_ioctx = context;
+    auto const listing = cucascade::io::engine_api<cucascade::io::object_listing>(as_ioctx);
+    REQUIRE(listing != nullptr);
+    CHECK(as_ioctx.use_count() == 3);
+    CHECK(listing->list_objects("bucket", "data/").size() == 2);
+    CHECK(cucascade::io::engine_api<cucascade::io::uring::uring_diagnostics>(as_ioctx) == nullptr);
+    CHECK(as_ioctx.use_count() == 3);
+  }
 
   // What only the uring_http engine has: reported, not faked.
   std::vector<std::string> const paths{"s3://bucket/object.bin"};

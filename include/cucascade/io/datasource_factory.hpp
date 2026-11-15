@@ -128,6 +128,10 @@ class io_context_registry {
   /// is no catch-all backend).
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
+  /// The backend that serves local regular files under the configured
+  /// @c backend (see @c lookup_path): what a host builds as its local context.
+  [[nodiscard]] io_context_type local_type() const noexcept { return _local_type; }
+
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
 
   /**

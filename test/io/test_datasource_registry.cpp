@@ -26,6 +26,8 @@
 #endif
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/engine_ioctx.hpp>
+#include <cucascade/io/object_listing.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -41,6 +43,7 @@
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -273,10 +276,58 @@ TEST_CASE("the uring context is served by kvikIO's uring engine plugin", "[io][r
   CHECK(std::move(future).get(std::chrono::seconds{30}) == magic.size());
   CHECK(magic == std::array<std::uint8_t, 4>{0x7f, 'E', 'L', 'F'});
 
+  // The engine's gauges are reached by asking the context for that interface, not by casting
+  // it to the uring context class; an interface the engine lacks is absent.
+  {
+    auto const diagnostics =
+      cucascade::io::engine_api<cucascade::io::uring::uring_diagnostics>(context);
+    REQUIRE(diagnostics != nullptr);
+    CHECK(diagnostics->reactor_gauges().size() == 1);
+    CHECK(cucascade::io::engine_api<cucascade::io::object_listing>(context) == nullptr);
+  }
+
   // Destroying the context shuts the engine down and stops selecting it.
   context.reset();
   CHECK(
     kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local).empty());
+}
+
+TEST_CASE("engine_api of no context is null", "[io][registry]")
+{
+  CHECK(cucascade::io::engine_api<cucascade::io::object_listing>(nullptr) == nullptr);
+}
+
+TEST_CASE("io_backend round-trips through its config spelling", "[io][registry][config]")
+{
+  for (auto const [name, backend] : {std::pair{"native", io_backend::native},
+                                     std::pair{"cufile", io_backend::cufile},
+                                     std::pair{"cufile_posix", io_backend::cufile_posix}}) {
+    CAPTURE(name);
+    io_backend parsed{};
+    REQUIRE(cucascade::io::string_to_enum(name, parsed));
+    CHECK(parsed == backend);
+    std::string rendered;
+    REQUIRE(cucascade::io::enum_to_string(backend, rendered));
+    CHECK(rendered == name);
+  }
+  // Names are exact: no engine names, no other case.
+  auto parsed = io_backend::cufile;
+  for (auto const* name : {"", "NATIVE", "uring", "kvikio", "posix", "cufile_reactor"}) {
+    CAPTURE(name);
+    CHECK_FALSE(cucascade::io::string_to_enum(name, parsed));
+  }
+  CHECK(parsed == io_backend::cufile);
+}
+
+TEST_CASE("the registry names the backend that serves local files", "[io][registry][config]")
+{
+  CHECK(registry_fixture{}.registry.local_type() == io_context_type::uring);
+  CHECK(registry_fixture{config_for(io_backend::cufile_posix)}.registry.local_type() ==
+        io_context_type::cufile_posix);
+#ifdef CUCASCADE_HAS_CUFILE
+  CHECK(registry_fixture{config_for(io_backend::cufile)}.registry.local_type() ==
+        io_context_type::cufile);
+#endif
 }
 
 // The uring_http engine exists but cannot be created (here: an explicit fan-out larger than the

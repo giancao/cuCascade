@@ -35,6 +35,10 @@
 
 namespace cucascade::io::uring {
 
+/// The gauges of the `uring` engine: reach it with
+/// `engine_api<uring_diagnostics>(ctx)`.
+using kvikio::io::uring::uring_diagnostics;
+
 /**
  * @brief An @c engine_ioctx over the `uring` engine: local files through io_uring.
  *
@@ -64,7 +68,7 @@ class uring_ioctx : public engine_ioctx {
   /// the background; callers that want them poll this.
   [[nodiscard]] std::vector<uring_reactor::gauges> reactor_gauges() noexcept
   {
-    auto* diagnostics = dynamic_cast<kvikio::io::uring::uring_diagnostics*>(&engine());
+    auto* diagnostics = dynamic_cast<uring_diagnostics*>(&engine());
     return diagnostics == nullptr ? std::vector<uring_reactor::gauges>{}
                                   : diagnostics->reactor_gauges();
   }

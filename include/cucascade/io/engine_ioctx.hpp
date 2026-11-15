@@ -205,4 +205,26 @@ class engine_ioctx : public ioctx {
   io_context_type _type;
 };
 
+/**
+ * @brief An optional interface of the engine serving @p ctx.
+ *
+ * What an engine offers beyond the engine interface (listing a bucket, the
+ * `uring` gauges, ...) is a header-only interface the engine implements. A host
+ * asks for it here by the interface it needs, rather than by casting @p ctx to
+ * the class of one backend, so the same code works with every engine that
+ * implements it.
+ *
+ * @tparam Api the interface, e.g. @c object_listing or @c uring::uring_diagnostics
+ * @return the interface, sharing ownership of @p ctx so that it stays valid for
+ *         as long as it is held; null when @p ctx is null, is not served by a
+ *         kvikIO engine, or its engine does not implement @p Api
+ */
+template <class Api>
+[[nodiscard]] std::shared_ptr<Api> engine_api(std::shared_ptr<ioctx> const& ctx) noexcept
+{
+  auto const* front = dynamic_cast<engine_ioctx const*>(ctx.get());
+  auto* api         = front == nullptr ? nullptr : dynamic_cast<Api*>(&front->engine());
+  return api == nullptr ? nullptr : std::shared_ptr<Api>(ctx, api);
+}
+
 }  // namespace cucascade::io
