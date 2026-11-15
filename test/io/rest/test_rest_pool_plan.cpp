@@ -37,8 +37,10 @@
 #include <vector>
 
 using namespace cucascade::io::rest;
-using cucascade::memory::nic_queue_irq;
-using cucascade::memory::nic_topology;
+// The plan takes the engine's description of the interface (kvikIO's), which cuCascade
+// fills in from what it discovers.
+using kvikio::io::nic_queue_irq;
+using kvikio::io::nic_topology;
 namespace tu = cucascade::exec::thread_util;
 
 namespace {
@@ -452,8 +454,7 @@ TEST_CASE("planned_reactor_cpus matches the pool's plan", "[rest_pool_plan]")
   CHECK(cucascade::io::rest::planned_reactor_cpus(4, cfg).empty());
 
   cfg.pin_to_irq_cpus = true;
-  auto const iface    = mem::select_egress_interface(cfg.interface);
-  auto const nic      = iface ? mem::discover_nic(*iface) : std::nullopt;
+  auto const nic      = cucascade::io::rest::discover_egress_nic(cfg.interface);
   for (std::size_t const n : {std::size_t{0}, std::size_t{3}}) {
     auto expected = plan_rest_pool(n, true, nic).pin_cpus;
     std::sort(expected.begin(), expected.end());
@@ -464,10 +465,9 @@ TEST_CASE("planned_reactor_cpus matches the pool's plan", "[rest_pool_plan]")
 
 TEST_CASE("pool plan on this host (informational)", "[rest_pool_plan]")
 {
-  namespace mem    = cucascade::memory;
-  auto const iface = mem::select_egress_interface("");
-  auto const nic   = iface ? mem::discover_nic(*iface) : std::nullopt;
-  auto const plan  = plan_rest_pool(0, true, nic);
+  namespace mem   = cucascade::memory;
+  auto const nic  = cucascade::io::rest::discover_egress_nic("");
+  auto const plan = plan_rest_pool(0, true, nic);
   reactor_placement placed;
   std::thread([&] {
     placed =

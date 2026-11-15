@@ -94,8 +94,7 @@ std::unique_ptr<rest_reactor> make_reactor(loopback_range_server const& server, 
 {
   auto authorizer = std::make_shared<mock_authorizer>(
     cucascade::io::rest::authorized_request{server.endpoint() + "/bucket/object.bin", {}});
-  auto context =
-    std::make_shared<rest_reactor::reactor_context>(cfg, std::move(authorizer), nullptr);
+  auto context = cucascade::io::rest::make_reactor_context(cfg, std::move(authorizer), nullptr);
   return std::make_unique<rest_reactor>(std::move(context), "validation-tag-test");
 }
 
@@ -103,8 +102,7 @@ std::shared_ptr<rest_ioctx> make_ioctx(loopback_range_server const& server, conf
 {
   auto authorizer = std::make_shared<mock_authorizer>(
     cucascade::io::rest::authorized_request{server.endpoint() + "/bucket/object.bin", {}});
-  auto context =
-    std::make_shared<rest_reactor::reactor_context>(cfg, std::move(authorizer), nullptr);
+  auto context = cucascade::io::rest::make_reactor_context(cfg, std::move(authorizer), nullptr);
   return std::make_shared<rest_ioctx>(1, std::move(context));
 }
 

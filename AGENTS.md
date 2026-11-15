@@ -8,7 +8,7 @@ cache). Each library is built as `<name>_shared` and `<name>_static`, with stric
 | Library | Sources | Depends on |
 | --- | --- | --- |
 | `cucascade_cudf` (`CUCASCADE_BUILD_CUDF`) | `src/cudf`, `include/cucascade/cudf` | io, core, libcudf |
-| `cucascade_io` (`CUCASCADE_BUILD_IO`) | `src/{io,exec}`, `include/cucascade/{io,exec}` | core, liburing, OpenSSL, kvikIO (`CUCASCADE_USE_KVIKIO`) |
+| `cucascade_io` (`CUCASCADE_BUILD_IO`) | `src/io`, `include/cucascade/{io,exec}` | core, kvikIO (`CUCASCADE_USE_KVIKIO`) and its engine plugins (liburing, OpenSSL) |
 | `cucascade` (core) | `src/{memory,data,cuda}`, `include/cucascade/{memory,data,cuda,utils,log}`, `include/cucascade/*.hpp` | topology, RMM, CUDA runtime |
 | `cucascade_topology_discovery` | `src/memory/topology_discovery.cpp`, `src/log` | NVML; never a link-time `libcuda` dependency |
 
@@ -48,23 +48,34 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   `-DCUCASCADE_BUILD_IO=OFF -DCUCASCADE_USE_KVIKIO=OFF`. To build another checkout, set
   `CUCASCADE_KVIKIO_SOURCE_DIR`; set it to an empty string to link an installed kvikIO, which
   must be the POC fork (upstream kvikIO lacks the `kvikio/exec` and `kvikio/io` headers).
-- Much of the io layer now lives in the kvikIO submodule and is re-exported here under its
-  cuCascade name: `cucascade::exec::{semi_future,promise,future,try_t,invocable}`, the request
-  types in `io/types.hpp` and `io/io_request.hpp`, `byte_range`, `object_identity`, `io_utils`,
-  `tiered_queue`, `slot_pool`, the URI parser, the S3 listing code, and everything under
-  `io/uring/`. `templated_ioctx` is glue over kvikIO's `reactor_dispatch`. Change these in the
-  kvikIO submodule (`kvikio/cpp/include/kvikio/{exec,io}`), commit there first, then bump the
+- The io engines live in the kvikIO submodule and are re-exported here under their cuCascade
+  names: `cucascade::exec::{semi_future,promise,future,try_t,invocable,admission_control}`,
+  `exec::thread_util`, the request and error types, `byte_range`, `object_identity`, `io_utils`,
+  `tiered_queue`, `slot_pool`, the URI parser, `object_store_config`, and everything under
+  `io/uring/`, `io/cufile/` (except the per-path GDS probe), `io/rest/` and `io/tls/`.
+  `templated_ioctx` is glue over kvikIO's `reactor_dispatch`. Change these in the kvikIO
+  submodule (`kvikio/cpp/{include/kvikio,src}/{exec,io}`), commit there first, then bump the
   submodule here. `CUCASCADE_USE_ABSEIL_INVOCABLE` and the moodycamel namespace are passed on to
   the kvikIO build and must agree with it.
-- The io_uring reactor is kvikIO's engine plugin `libkvikio_engine_uring.so`, built next to
-  `libkvikio.so`. The cuCascade libraries do not link it: `make_uring_ioctx_factory` selects the
-  engine by name in kvikIO's registry and falls back to the built-in `cufile_posix` engine when
-  that fails. Tests and benchmarks that use `uring_reactor` or build a `uring_ioctx` from a
-  reactor context link `kvikio::engine_uring`; `make_reactor_context` wraps a HOST memory
-  resource for them.
-- The REST and cuFile reactors are still here and still use the CUDA runtime; where their
-  statuses meet kvikIO's request types (`CUresult`), convert with `to_driver_status` /
-  `to_runtime_status` (`io/io_request.hpp`).
+- What is left of the io layer here: `ioctx` with the `fs_cache` and metadata store,
+  `engine_ioctx` (the facade over a kvikIO engine) and its thin subclasses `uring_ioctx`,
+  `cufile_ioctx`, `rest_ioctx`, the staging source over a HOST memory resource, NIC and storage
+  discovery, the datasource registry, and s3rdma.
+- Each engine is a kvikIO plugin built next to `libkvikio.so`: `libkvikio_engine_uring.so`,
+  `libkvikio_engine_cufile_reactor.so`, `libkvikio_engine_uring_http.so`. The cuCascade libraries
+  do not link them; the factories select an engine by name in kvikIO's registry
+  (`make_uring_ioctx_factory` falls back to the built-in `cufile_posix` engine when that fails).
+  Tests and benchmarks that use reactor, transport or TLS classes directly, or build an ioctx
+  from a reactor context, link the plugin target (`kvikio::engine_uring`,
+  `kvikio::engine_cufile_reactor`, `kvikio::engine_uring_http`); `make_reactor_context` wraps a
+  HOST memory resource for them.
+- `cucascade::io::{rest,tls,http,net}` are namespaces with a using-directive for kvikIO's
+  (`io/rest/forward.hpp`), so qualified names resolve to kvikIO's declarations. Do not declare a
+  nested namespace there whose name kvikIO also uses (`detail`, `s3`): it would hide kvikIO's.
+  The io test binary force-includes `forward.hpp` because the tests of the REST layers include
+  kvikIO's private headers (`"io/rest/..."`, `"io/tls/..."`, found through the plugin target).
+- A staging source reports exhaustion in its own type: `host_staging_source` makes it an
+  `rmm::out_of_memory`, which hosts retry on.
 - Running a kvikIO gtest from a standalone kvikIO build needs
   `LD_PRELOAD=<build>/libkvikio.so`, or the conda copy of kvikIO is loaded instead.
 

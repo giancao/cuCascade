@@ -89,7 +89,7 @@ inline std::shared_ptr<io::rest::rest_reactor::reactor_context> make_rest_contra
   io::rest::config cfg                          = rest_contract_config(),
   memory::fixed_size_host_memory_resource* host = nullptr)
 {
-  return std::make_shared<io::rest::rest_reactor::reactor_context>(
+  return cucascade::io::rest::make_reactor_context(
     cfg, std::make_shared<list_capable_mock_authorizer>(server.endpoint()), host);
 }
 

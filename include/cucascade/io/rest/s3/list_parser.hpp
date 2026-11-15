@@ -22,18 +22,10 @@
  * @file list_parser.hpp
  * @brief Parser of S3 ListObjectsV2 responses.
  *
- * The implementation lives in kvikIO (`kvikio/io/rest/s3/list_parser.hpp`); this
- * header re-exports it in `cucascade::io::rest::s3`.
+ * Lives in kvikIO (`kvikio/io/rest/s3/list_parser.hpp`); see `cucascade/io/rest/forward.hpp` for
+ * how `cucascade::io::rest` and `cucascade::io::tls` name it.
  */
 
+#include <cucascade/io/rest/forward.hpp>
+
 #include <kvikio/io/rest/s3/list_parser.hpp>
-
-namespace cucascade::io::rest::s3 {
-
-using kvikio::io::rest::s3::default_max_list_objects;
-using kvikio::io::rest::s3::default_max_scanned_objects;
-using kvikio::io::rest::s3::list_entry;
-using kvikio::io::rest::s3::list_objects_v2_page;
-using kvikio::io::rest::s3::parse_list_objects_v2;
-
-}  // namespace cucascade::io::rest::s3

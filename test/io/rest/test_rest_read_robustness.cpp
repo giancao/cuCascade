@@ -108,11 +108,17 @@ class probed_ioctx final : public rest_ioctx {
   using rest_ioctx::rest_ioctx;
   [[nodiscard]] transport_stats reactor_stats(std::size_t i = 0) const
   {
-    return _reactors.at(i)->stats();
+    return pool().reactor_stats(i);
   }
   [[nodiscard]] std::size_t queued(std::size_t i = 0) const
   {
-    return _reactors.at(i)->queued_bytes();
+    return pool().reactor_queued_bytes(i);
+  }
+
+ private:
+  [[nodiscard]] kvikio::io::rest::uring_http_engine const& pool() const
+  {
+    return dynamic_cast<kvikio::io::rest::uring_http_engine const&>(engine());
   }
 };
 
@@ -126,7 +132,7 @@ read_fixture make_ioctx(loopback_range_server const& server,
                         cucascade::memory::fixed_size_host_memory_resource* host = nullptr)
 {
   auto authorizer = std::make_shared<list_capable_mock_authorizer>(server.endpoint());
-  auto context    = std::make_shared<rest_reactor::reactor_context>(cfg, authorizer, host);
+  auto context    = cucascade::io::rest::make_reactor_context(cfg, authorizer, host);
   auto ioctx      = std::make_shared<probed_ioctx>(1, std::move(context));
   ioctx->start();
   return {std::move(authorizer), std::move(ioctx)};
@@ -805,7 +811,7 @@ TEST_CASE("rest reactor worker survives an allocation failure anywhere in a read
   for (std::size_t n = 1; n < 5000 && !clean; ++n) {
     INFO("worker allocation " << n);
     auto authorizer = std::make_shared<faulting_authorizer>(server.endpoint(), n);
-    auto context    = std::make_shared<rest_reactor::reactor_context>(cfg, authorizer, nullptr);
+    auto context    = cucascade::io::rest::make_reactor_context(cfg, authorizer, nullptr);
     auto ioctx      = std::make_shared<probed_ioctx>(1, std::move(context));
     ioctx->start();
     rest_shutdown_guard cleanup{*ioctx};
@@ -1151,7 +1157,7 @@ TEST_CASE("rest control-plane calls never report an incomplete 2xx body as succe
   auto cfg               = rest_contract_config();
   cfg.max_retry_attempts = 2;
   auto authorizer        = std::make_shared<list_capable_mock_authorizer>(server.endpoint());
-  auto context           = std::make_shared<rest_reactor::reactor_context>(cfg, authorizer);
+  auto context           = cucascade::io::rest::make_reactor_context(cfg, authorizer);
   rest_reactor reactor(context);
   reactor.start();
   CHECK_THROWS(reactor.list_page("bucket", "prefix/", "list-type=2&prefix=prefix%2F"));
@@ -1172,7 +1178,7 @@ TEST_CASE("rest connections with bytes past the response are not reused", "[rest
   raw_response_server server(response, /*keep_alive=*/true);
   auto cfg        = rest_contract_config();
   auto authorizer = std::make_shared<list_capable_mock_authorizer>(server.endpoint());
-  auto context    = std::make_shared<rest_reactor::reactor_context>(cfg, authorizer);
+  auto context    = cucascade::io::rest::make_reactor_context(cfg, authorizer);
   rest_reactor reactor(context);
   reactor.start();
   for (int i = 0; i < 3; ++i) {

@@ -88,10 +88,16 @@ class probed_ioctx final : public rest_ioctx {
   using rest_ioctx::rest_ioctx;
   [[nodiscard]] transport_stats reactor_stats(std::size_t i = 0) const
   {
-    return _reactors.at(i)->stats();
+    return pool().reactor_stats(i);
   }
-  [[nodiscard]] std::size_t reactor_count() const noexcept { return _reactors.size(); }
-  [[nodiscard]] rest::detail::pool_placement const& placement() const { return *_placement; }
+  [[nodiscard]] std::size_t reactor_count() const noexcept { return pool().reactor_count(); }
+  [[nodiscard]] rest::detail::pool_placement const& placement() const { return pool().placement(); }
+
+ private:
+  [[nodiscard]] kvikio::io::rest::uring_http_engine const& pool() const
+  {
+    return dynamic_cast<kvikio::io::rest::uring_http_engine const&>(engine());
+  }
 };
 
 /// Records when each LIST was authorized (the worker authorizes every exchange as it issues it).
@@ -132,7 +138,7 @@ std::shared_ptr<probed_ioctx> make_ioctx(std::string const& endpoint,
                                          std::shared_ptr<rest::request_authorizer> auth = {})
 {
   if (!auth) { auth = std::make_shared<list_capable_mock_authorizer>(endpoint); }
-  auto context = std::make_shared<rest_reactor::reactor_context>(cfg, std::move(auth), nullptr);
+  auto context = cucascade::io::rest::make_reactor_context(cfg, std::move(auth), nullptr);
   auto ioctx   = std::make_shared<probed_ioctx>(reactors, std::move(context));
   ioctx->start();
   return ioctx;
@@ -714,7 +720,7 @@ TEST_CASE("rest fan_out is validated against the reactor count", "[rest][fan_out
   loopback_range_server server(rest_test_payload(64));
   auto cfg = rest_contract_config();
   auto ctx = [&](rest::config c) {
-    return std::make_shared<rest_reactor::reactor_context>(
+    return cucascade::io::rest::make_reactor_context(
       c, std::make_shared<list_capable_mock_authorizer>(server.endpoint()), nullptr);
   };
   cfg.fan_out = 3;
@@ -750,13 +756,10 @@ TEST_CASE("rest pool size follows the placement plan; auto (0) sizes from the NI
 {
   loopback_range_server server(rest_test_payload(64));
   auto cfg = rest_contract_config();
-  auto ctx = std::make_shared<rest_reactor::reactor_context>(
+  auto ctx = cucascade::io::rest::make_reactor_context(
     cfg, std::make_shared<list_capable_mock_authorizer>(server.endpoint()), nullptr);
   // What the ioctx computes, independently: the egress NIC (if any) and the plan.
-  std::optional<cucascade::memory::nic_topology> nic;
-  if (auto const iface = cucascade::memory::select_egress_interface(cfg.interface)) {
-    nic = cucascade::memory::discover_nic(*iface);
-  }
+  auto const nic      = cucascade::io::rest::discover_egress_nic(cfg.interface);
   auto const expected = rest::plan_rest_pool(0, cfg.pin_to_irq_cpus, nic);
   INFO(rest::describe_rest_pool(expected, nic, {}));
   probed_ioctx autosized{0, ctx};
@@ -777,7 +780,7 @@ TEST_CASE("rest reactor threads pin themselves to their planned CPU before servi
   if (allowed.size() < 2) { SKIP("needs at least two CPUs in the affinity mask"); }
   auto payload = rest_test_payload(4096);
   loopback_range_server server(payload);
-  auto ctx = std::make_shared<rest_reactor::reactor_context>(
+  auto ctx = cucascade::io::rest::make_reactor_context(
     rest_contract_config(), std::make_shared<list_capable_mock_authorizer>(server.endpoint()));
   auto placement             = std::make_shared<rest::detail::pool_placement>();
   placement->plan.n_reactors = 2;
@@ -1077,7 +1080,7 @@ TEST_CASE("rest config validates every field", "[rest][config]")
   // A reactor refuses an invalid config.
   auto invalid            = rest_contract_config();
   invalid.max_connections = 0;
-  CHECK_THROWS_AS(rest_reactor(std::make_shared<rest_reactor::reactor_context>(
+  CHECK_THROWS_AS(rest_reactor(cucascade::io::rest::make_reactor_context(
                     invalid, std::make_shared<list_capable_mock_authorizer>("http://x"))),
                   std::invalid_argument);
 }
