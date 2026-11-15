@@ -318,13 +318,17 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     endif()
   endif()
 
-  # Third-party dependencies of the cucascade-io library (datasource layer)
+  # Third-party dependencies of the io layer. The io library itself needs only
+  # kvikIO: the engines that use liburing and OpenSSL are kvikIO plugins.
   if(CUCASCADE_BUILD_IO)
+    # liburing: the DISK tier (in the cudf library) probes whether this process
+    # may use io_uring, and so do the tests.
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-    # OpenSSL: TLS for the REST transport (handshakes, the user-space record
-    # layer's AES-GCM and key schedule) and SigV4's HMAC / SHA-256.
-    find_package(OpenSSL REQUIRED)
+    # OpenSSL: only the tests of the REST layers (TLS, the loopback servers).
+    if(CUCASCADE_BUILD_TESTS)
+      find_package(OpenSSL REQUIRED)
+    endif()
 
     # cuFile / GPUDirect Storage — the cufile reactor dlopen()s libcufile at run
     # time and needs only cufile.h to build (it ships with the CUDA toolkit;
@@ -393,8 +397,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     target_compile_definitions(
       cucascade_io_thirdparty
       INTERFACE CUCASCADE_MOODYCAMEL_NAMESPACE=${CUCASCADE_MOODYCAMEL_NAMESPACE}
-                KVIKIO_MOODYCAMEL_NAMESPACE=${CUCASCADE_MOODYCAMEL_NAMESPACE}
-    )
+                KVIKIO_MOODYCAMEL_NAMESPACE=${CUCASCADE_MOODYCAMEL_NAMESPACE})
 
     # cucascade::exec::invocable backend. When abseil is requested, reuse a
     # provided target, else an already-defined absl::any_invocable, else
@@ -583,14 +586,15 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   # include dir, uring types, ...).
   if(CUCASCADE_BUILD_IO)
     target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_io_objects)
+    # src/cudf/disk_io_context.cpp probes io_uring with liburing.
+    target_link_libraries(cucascade_cudf_objects PRIVATE PkgConfig::LIBURING)
   endif()
 endif()
 
 if(CUCASCADE_BUILD_IO)
   # Link libraries shared by the io object library and the installable io
-  # targets. PkgConfig::* imported targets are reconstructed on the consumer
-  # side by cuCascadeConfig.cmake (same names).
-  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING OpenSSL::SSL OpenSSL::Crypto)
+  # targets: only kvikIO, whose engine plugins carry liburing and OpenSSL.
+  set(CUCASCADE_IO_LINK_LIBS)
   if(CUCASCADE_USE_KVIKIO)
     list(APPEND CUCASCADE_IO_LINK_LIBS kvikio::kvikio)
   endif()
@@ -598,8 +602,8 @@ if(CUCASCADE_BUILD_IO)
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}
                                 cucascade_io_thirdparty)
-  # cuCascade loads the io_uring engine by name at run time, so nothing links it;
-  # this makes sure it is built whenever the io library is.
+  # cuCascade loads the io_uring engine by name at run time, so nothing links
+  # it; this makes sure it is built whenever the io library is.
   if(TARGET kvikio_engine_uring)
     add_dependencies(cucascade_io_objects kvikio_engine_uring)
   endif()
@@ -697,8 +701,11 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
       target_link_libraries(cucascade_cudf_static PUBLIC cudf::cudf
                                                          cucascade_static)
       if(CUCASCADE_BUILD_IO)
-        # The datasource bridge references io-core symbols.
-        target_link_libraries(cucascade_cudf_static PUBLIC cucascade_io_static)
+        # The datasource bridge references io-core symbols; the DISK tier's
+        # io_uring probe needs liburing. PkgConfig::LIBURING is reconstructed on
+        # the consumer side by cuCascadeConfig.cmake (same name).
+        target_link_libraries(cucascade_cudf_static PUBLIC cucascade_io_static
+                                                           PkgConfig::LIBURING)
       endif()
       target_compile_features(cucascade_cudf_static PUBLIC cxx_std_20)
 
@@ -781,6 +788,7 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
       if(CUCASCADE_BUILD_IO)
         # The datasource bridge references io-core symbols.
         target_link_libraries(cucascade_cudf_shared PUBLIC cucascade_io_shared)
+        target_link_libraries(cucascade_cudf_shared PRIVATE PkgConfig::LIBURING)
       endif()
       target_compile_features(cucascade_cudf_shared PUBLIC cxx_std_20)
 

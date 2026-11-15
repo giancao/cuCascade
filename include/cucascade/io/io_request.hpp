@@ -44,12 +44,13 @@ using kvikio::io::detail::grouped_io_request;
 using kvikio::io::detail::io_op_request;
 using kvikio::io::detail::validate_write_slices;
 
-// -- Transitional: reactors still written against the CUDA runtime ---------------
+// -- Where the CUDA runtime meets the request types --------------------------------
 //
-// The runtime's `cudaError_t` and the driver's `CUresult` are different
-// enumerations with the same numeric values for the statuses they share. These
-// two functions name the conversion at the places where a runtime status meets
-// the request types; they go away as each reactor moves to the driver API.
+// The request types are kvikIO's and report CUDA failures as the driver's
+// `CUresult`. cuCascade's cache works with the CUDA runtime, whose `cudaError_t`
+// is a different enumeration with the same numeric values for the statuses the
+// two share. This function names the conversion where a runtime status is handed
+// to a request's coordinator.
 
 static_assert(static_cast<int>(cudaSuccess) == static_cast<int>(CUDA_SUCCESS));
 static_assert(static_cast<int>(cudaErrorInvalidValue) ==
@@ -63,12 +64,6 @@ static_assert(static_cast<int>(cudaErrorUnknown) == static_cast<int>(CUDA_ERROR_
 [[nodiscard]] constexpr CUresult to_driver_status(cudaError_t status) noexcept
 {
   return static_cast<CUresult>(status);
-}
-
-/// The runtime status with the meaning of the driver status @p status.
-[[nodiscard]] constexpr cudaError_t to_runtime_status(CUresult status) noexcept
-{
-  return static_cast<cudaError_t>(status);
 }
 
 }  // namespace cucascade::io
