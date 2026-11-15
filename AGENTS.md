@@ -61,6 +61,12 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   `engine_ioctx` (the facade over a kvikIO engine) and its thin subclasses `uring_ioctx`,
   `cufile_ioctx`, `rest_ioctx`, the staging source over a HOST memory resource, NIC and storage
   discovery, the datasource registry, and s3rdma.
+- A host chooses a backend only through `io_config::backend` (`io_backend`, with
+  `string_to_enum` / `enum_to_string` for its config spelling) and asks the registry which
+  context serves local files (`io_context_registry::local_type()`). What an engine offers beyond
+  the engine interface (bucket listing, the `uring` gauges) is reached with
+  `engine_api<Api>(ctx)` (`engine_ioctx.hpp`), by interface; hosts should not cast an `ioctx` to
+  `uring_ioctx` or `rest_ioctx`.
 - Each engine is a kvikIO plugin built next to `libkvikio.so`: `libkvikio_engine_uring.so`,
   `libkvikio_engine_cufile_reactor.so`, `libkvikio_engine_uring_http.so`. The cuCascade libraries
   do not link them; the factories select an engine by name in kvikIO's registry

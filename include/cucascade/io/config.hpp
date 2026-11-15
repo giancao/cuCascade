@@ -26,6 +26,8 @@
 #include <cucascade/io/uring/config.hpp>
 
 #include <cstddef>
+#include <string>
+#include <string_view>
 
 namespace cucascade::io {
 
@@ -48,15 +50,44 @@ enum class io_backend {
   cufile_posix,
 };
 
+/// Parse an @ref io_backend from its lowercase config spelling.  A host that
+/// lets its users choose the backend parses the value with this, so the
+/// accepted names are cuCascade's.
+inline bool string_to_enum(std::string_view sv, io_backend& out)
+{
+  if (sv == "native") {
+    out = io_backend::native;
+  } else if (sv == "cufile") {
+    out = io_backend::cufile;
+  } else if (sv == "cufile_posix") {
+    out = io_backend::cufile_posix;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+/// Render an @ref io_backend as its canonical lowercase name.
+inline bool enum_to_string(io_backend backend, std::string& out)
+{
+  switch (backend) {
+    case io_backend::native: out = "native"; return true;
+    case io_backend::cufile: out = "cufile"; return true;
+    case io_backend::cufile_posix: out = "cufile_posix"; return true;
+  }
+  return false;
+}
+
 /**
  * @brief Top-level configuration for the cucascade::io datasource layer.
  *
  * Consumed by @c io_context_registry and the per-backend ioctx factories.
  *
  * @c backend selects the IO stack: @ref io_backend::native routes local paths
- * to @c uring_ioctx and @c s3:// URLs to the REST backend, and
- * @ref io_backend::cufile routes local regular files to @c cufile_ioctx
- * (@c s3:// stays on REST).
+ * to @c uring_ioctx and @c s3:// URLs to the REST backend,
+ * @ref io_backend::cufile routes local regular files to @c cufile_ioctx and
+ * @ref io_backend::cufile_posix to kvikIO's built-in engine (@c s3:// stays on
+ * REST in both).
  *
  * @c cache is the read path's whole caching configuration, and its only home;
  * @ref apply_cache_mode derives @c uring.use_odirect and @c cache.dispose_on_idle
