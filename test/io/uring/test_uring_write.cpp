@@ -239,8 +239,8 @@ class write_context {
                          cucascade::io::uring::config cfg = cucascade::io::uring::config{},
                          bool start                       = true)
     : _mr{0, _upstream, capacity, capacity, block_size, 64, 0},
-      _ctx{std::make_shared<uring_ioctx>(
-        n_reactors, std::make_shared<uring_reactor::reactor_context>(cfg, &_mr))}
+      _ctx{std::make_shared<uring_ioctx>(n_reactors,
+                                         cucascade::io::uring::make_reactor_context(cfg, &_mr))}
   {
     if (start) _ctx->start();
   }

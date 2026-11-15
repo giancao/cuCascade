@@ -19,6 +19,8 @@
 #include <cucascade/io/engine_ioctx.hpp>
 #include <cucascade/io/host_staging_source.hpp>
 
+#include <kvikio/io/engine_registry.hpp>
+
 #include <rmm/error.hpp>
 
 #include <cstddef>
@@ -34,6 +36,14 @@ engine_ioctx::engine_ioctx(std::shared_ptr<kvikio::io::engine> engine, io_contex
 {
   if (_engine == nullptr) { throw std::invalid_argument("engine_ioctx: the engine is null"); }
   _caps = _engine->capabilities();
+}
+
+engine_ioctx::~engine_ioctx()
+{
+  this->pre_destroy();
+  _engine->shutdown();
+  // The registry keeps a selected engine alive; this context was its user.
+  kvikio::io::engine_registry::instance().release(_engine.get());
 }
 
 namespace {

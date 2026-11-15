@@ -173,7 +173,7 @@ class spp_reactor {
     std::size_t slices_per_pass,
     std::size_t low_service_interval = cucascade::io::uring::config{}.low_service_interval)
     : _mr{0, _upstream, capacity, capacity, block_size, 64, 0},
-      _reactor{std::make_shared<uring_reactor::reactor_context>(
+      _reactor{cucascade::io::uring::make_reactor_context(
                  config_for(slices_per_pass, low_service_interval), &_mr),
                ""}
   {
@@ -651,7 +651,7 @@ TEST_CASE("io_uring staging reservation follows the byte budget, not the slot ca
   cucascade::memory::fixed_size_host_memory_resource mr{
     0, upstream, capacity, capacity, block_size, 4, 0};
 
-  auto ctx = std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr);
+  auto ctx = cucascade::io::uring::make_reactor_context(cucascade::io::uring::config{}, &mr);
   uring_reactor reactor{ctx, ""};
 
   REQUIRE_NOTHROW(reactor.start());
@@ -669,7 +669,7 @@ TEST_CASE("io_uring staging failure names the reactor and the requested bytes", 
   cucascade::memory::fixed_size_host_memory_resource mr{
     0, upstream, 1UL << 20, 1UL << 20, block_size, 1, 0};
 
-  auto ctx = std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr);
+  auto ctx = cucascade::io::uring::make_reactor_context(cucascade::io::uring::config{}, &mr);
   uring_reactor reactor{ctx, ""};
 
   REQUIRE_THROWS_WITH(
@@ -701,8 +701,7 @@ TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[io][uring
       cucascade::memory::fixed_size_host_memory_resource mr{
         0, upstream, capacity, capacity, block_size, 4, 0};
 
-      auto ctx =
-        std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr);
+      auto ctx = cucascade::io::uring::make_reactor_context(cucascade::io::uring::config{}, &mr);
       uring_reactor reactor{ctx, ""};
       reactor.start();
       reactor.shutdown();
@@ -1287,7 +1286,7 @@ class ioctx_staging {
 
   explicit ioctx_staging(std::size_t n_reactors, cucascade::io::uring::config cfg = {})
     : _mr{0, _upstream, n_reactors * (128UL << 20), n_reactors * (128UL << 20), block_size, 64, 0},
-      _ctx{std::make_shared<uring_reactor::reactor_context>(cfg, &_mr)}
+      _ctx{cucascade::io::uring::make_reactor_context(cfg, &_mr)}
   {
   }
 
@@ -1329,7 +1328,8 @@ TEST_CASE("io_uring ioctx reads a range-batched host read end to end",
     ioctx_staging staging{n_reactors};
     uring_ioctx ioctx{n_reactors, staging.context()};
     ioctx.start();
-    REQUIRE(ioctx.range_batch_slices() == 8);
+    REQUIRE(dynamic_cast<kvikio::io::uring::uring_engine&>(ioctx.engine()).range_batch_slices() ==
+            8);
 
     std::vector<cucascade::io::slice> slices;
     for (auto const& r : ranges) {

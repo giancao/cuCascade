@@ -101,9 +101,7 @@ class started_context {
   {
     if (backend == "uring") {
       context = std::make_unique<cucascade::io::uring::uring_ioctx>(
-        1,
-        std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
-          cucascade::io::uring::config{}, &staging));
+        1, cucascade::io::uring::make_reactor_context(cucascade::io::uring::config{}, &staging));
     }
 #ifdef CUCASCADE_HAS_CUFILE
     else {

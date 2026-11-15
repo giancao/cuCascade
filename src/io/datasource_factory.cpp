@@ -37,14 +37,18 @@
 
 #include <kvikio/io/cufile_posix_engine.hpp>
 #include <kvikio/io/engine_registry.hpp>
+#include <kvikio/io/uring/uring_engine.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <exception>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
+#include <system_error>
 #include <utility>
 
 namespace cucascade::io {
@@ -105,6 +109,15 @@ factory_type make_cufile_ioctx_factory()
 }
 #endif
 
+/// A local regular file: what both local reactors and kvikIO's local engines serve.
+bool is_local_regular_file(std::string_view path)
+{
+  std::error_code ec;
+  return std::filesystem::is_regular_file(std::filesystem::path{path}, ec) && !ec;
+}
+
+/// kvikIO's `uring` engine, selected by name in kvikIO's process-wide registry
+/// (which loads its plugin) and staging through the first HOST space.
 factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
@@ -116,9 +129,13 @@ factory_type make_uring_ioctx_factory(
           "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
         return nullptr;
       }
-      // One reactor_context shares config and the pinned staging resource.
-      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
-      return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
+      kvikio::io::uring::uring_options options;
+      options.n_reactors = config.uring_n_reactors;
+      options.cfg        = config.uring;
+      options.staging    = std::make_shared<host_staging_source>(*host_mr);
+      auto engine        = kvikio::io::engine_registry::instance().select(
+        kvikio::io::engine_route::local, kvikio::io::uring::uring_engine_name, options);
+      return std::make_shared<uring::uring_ioctx>(std::move(engine));
     } catch (const std::exception& e) {
       CUCASCADE_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -210,11 +227,11 @@ io_context_registry::io_context_registry(
 #endif
   _entries.emplace(io_context_type::uring,
                    entry{io_context_type::uring,
-                         &uring::uring_reactor::supports,
+                         &is_local_regular_file,
                          make_uring_ioctx_factory(_reservation_manager)});
   _entries.emplace(io_context_type::cufile_posix,
                    entry{io_context_type::cufile_posix,
-                         &uring::uring_reactor::supports,
+                         &is_local_regular_file,
                          make_cufile_posix_ioctx_factory(_reservation_manager)});
   _entries.emplace(io_context_type::restful,
                    entry{io_context_type::restful,

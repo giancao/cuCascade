@@ -1260,9 +1260,7 @@ TEST_CASE("cufile write throughput probe", "[.cufile-write-bench]")
     cucascade::memory::fixed_size_host_memory_resource mr{
       0, upstream, 2UL << 30, 2UL << 30, 1UL << 20, 128, 8};
     cucascade::io::uring::uring_ioctx ctx{
-      reactors,
-      std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
-        cucascade::io::uring::config{}, &mr)};
+      reactors, cucascade::io::uring::make_reactor_context(cucascade::io::uring::config{}, &mr)};
     ctx.start();
     run_write_probe("uring", ctx, dir, total, rounds);
     ctx.shutdown();

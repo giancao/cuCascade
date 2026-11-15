@@ -211,6 +211,12 @@ function(cucascade_add_kvikio)
   if(CUCASCADE_USE_ABSEIL_INVOCABLE)
     set(KvikIO_ABSEIL_INVOCABLE_TARGET ${_cucascade_absl_target})
   endif()
+  # The io_uring engine is a kvikIO plugin (libkvikio_engine_uring.so, next to
+  # libkvikio.so). It uses the same moodycamel copy as cuCascade.
+  set(KvikIO_BUILD_URING_ENGINE ON)
+  set(KvikIO_MOODYCAMEL_TARGET "${CUCASCADE_MOODYCAMEL_TARGET}")
+  set(KvikIO_MOODYCAMEL_INCLUDE_DIR "${CUCASCADE_MOODYCAMEL_INCLUDE_DIR}")
+  set(KvikIO_MOODYCAMEL_NAMESPACE "${CUCASCADE_MOODYCAMEL_NAMESPACE}")
   set(KvikIO_BUILD_BENCHMARKS OFF)
   set(KvikIO_BUILD_EXAMPLES OFF)
   set(KvikIO_BUILD_NSYS_PLUGIN OFF)
@@ -590,6 +596,11 @@ if(CUCASCADE_BUILD_IO)
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}
                                 cucascade_io_thirdparty)
+  # cuCascade loads the io_uring engine by name at run time, so nothing links it;
+  # this makes sure it is built whenever the io library is.
+  if(TARGET kvikio_engine_uring)
+    add_dependencies(cucascade_io_objects kvikio_engine_uring)
+  endif()
   target_include_directories(cucascade_io_objects
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_definitions(cucascade_io_objects

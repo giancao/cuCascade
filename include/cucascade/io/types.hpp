@@ -100,14 +100,7 @@ using kvikio::io::write_mode;
 using kvikio::io::write_open_options;
 using kvikio::io::write_slice;
 
-/// Raise @p target to @p value if it is smaller (an atomic maximum).
-inline void atomic_store_max(std::atomic<std::size_t>& target, std::size_t value) noexcept
-{
-  auto current = target.load(std::memory_order_relaxed);
-  while (current < value &&
-         !target.compare_exchange_weak(
-           current, value, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
-}
+using kvikio::io::atomic_store_max;
 
 class io_object_metadata {
  public:
