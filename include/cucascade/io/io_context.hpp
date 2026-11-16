@@ -613,6 +613,10 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
 
   // -- Writes that do not cover whole blocks ---------------------------------
   //
+  // Only for a backend that writes with O_DIRECT: @ref write_alignment_requirement
+  // is above 1 exactly then. Any other backend gets every write as the caller
+  // made it, as before.
+  //
   // A backend that writes with O_DIRECT (@ref min_alignment_requirement above 1)
   // can only write whole blocks that way. It is never handed less: the front
   // end completes the first and the last block of a write that is not block
@@ -626,6 +630,13 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   // Any other partial block is completed from the file (a read), or with zeros
   // past the end of the file. A file written this way ends on a block boundary.
 
+ public:
+  /// The unit a write must start on and cover whole multiples of for the backend
+  /// to write it directly. Above 1 only when the backend writes with O_DIRECT;
+  /// 1 (the default) means writes have no alignment requirement.
+  [[nodiscard]] virtual std::size_t write_alignment_requirement() const noexcept { return 1; }
+
+ private:
   /// Host bytes of a write that share a block with other bytes.
   struct write_edge_piece {
     std::size_t offset;

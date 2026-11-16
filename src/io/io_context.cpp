@@ -160,7 +160,7 @@ ioctx::~ioctx() = default;
 void ioctx::forget_overwritten_edge(const io_object& obj, std::span<const range> whole_ranges)
 {
   if (!_write_edges->any_remembered.load(std::memory_order_acquire)) return;
-  auto const block = std::max(min_alignment_requirement(), write_granule());
+  auto const block = write_alignment_requirement();
   auto const state = _write_edges->entry_of(obj);
   std::lock_guard lock(state->mutex);
   for (auto const& whole : whole_ranges) {
@@ -182,7 +182,7 @@ void ioctx::write_edge_blocks(const io_object& obj,
                               std::vector<write_edge_piece>& pieces,
                               std::span<const range> whole_ranges)
 {
-  auto const block = std::max(min_alignment_requirement(), write_granule());
+  auto const block = write_alignment_requirement();
   std::ranges::sort(pieces, {}, &write_edge_piece::offset);
   auto const state = _write_edges->entry_of(obj);
   std::lock_guard lock(state->mutex);
@@ -463,8 +463,8 @@ std::size_t ioctx::host_write(const io_object& obj,
   invalidate_cached(obj.object_path());
   try {
     std::size_t written = 0;
-    auto const block    = std::max(min_alignment_requirement(), write_granule());
-    if (min_alignment_requirement() > 1 && (offset % block != 0 || size % block != 0)) {
+    auto const block    = write_alignment_requirement();
+    if (write_alignment_requirement() > 1 && (offset % block != 0 || size % block != 0)) {
       // Never hand the backend less than a block: see write_edge_blocks.
       auto const end = offset + size;
       auto const first =
@@ -478,7 +478,7 @@ std::size_t ioctx::host_write(const io_object& obj,
       if (last > first) host_write_io(obj, first, last - first, src + (first - offset));
       written = size;
     } else {
-      if (min_alignment_requirement() > 1) {
+      if (write_alignment_requirement() > 1) {
         range const whole{offset, size};
         forget_overwritten_edge(obj, std::span{&whole, 1});
       }
@@ -548,9 +548,8 @@ exec::semi_future<std::size_t> ioctx::submit_write(const io_object& obj,
     auto const resolved = resolve_priority(priority, io_priority::high);
     // A backend that writes with O_DIRECT is handed whole blocks only; the bytes
     // that share a block with something else go through write_edge_blocks.
-    auto const block = min_alignment_requirement() > 1
-                         ? std::max(min_alignment_requirement(), write_granule())
-                         : std::size_t{1};
+    auto const block =
+      write_alignment_requirement() > 1 ? write_alignment_requirement() : std::size_t{1};
     struct cut {
       range head, whole, tail;
     };

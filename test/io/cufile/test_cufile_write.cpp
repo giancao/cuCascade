@@ -307,7 +307,10 @@ struct write_path {
 void check_same(std::vector<std::uint8_t> const& got, std::vector<std::uint8_t> want)
 {
   // The front end completes partial blocks with zeros: a file ends on a block boundary.
-  want.resize((want.size() + 4095) / 4096 * 4096, 0);
+  // Only with O_DIRECT: without it the file is exactly what was written.
+  if (auto const padded = (want.size() + 4095) / 4096 * 4096; got.size() == padded) {
+    want.resize(padded, 0);
+  }
   CHECK(got.size() == want.size());
   auto const n        = std::min(got.size(), want.size());
   std::size_t first   = n;
@@ -436,7 +439,10 @@ TEST_CASE("cufile host writes round-trip aligned and unaligned ranges", "[io][cu
         shadow.write(offset, bytes);
       }
     }
-    CHECK(object->size() == (shadow.bytes().size() + 4095) / 4096 * 4096);
+    {
+      auto const unit = ctx->write_alignment_requirement();
+      CHECK(object->size() == (shadow.bytes().size() + unit - 1) / unit * unit);
+    }
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
     ctx->flush(*object);
     REQUIRE_NOTHROW(ctx->flush_async(*object).get(30s));
@@ -489,7 +495,10 @@ TEST_CASE("cufile host writes from 8 B-aligned blocks land in place", "[io][cufi
       total += sl.size();
     }
     REQUIRE(ctx->host_writev_async(*object, slices).get(60s) == total);
-    CHECK(object->size() == (shadow.bytes().size() + 4095) / 4096 * 4096);
+    {
+      auto const unit = ctx->write_alignment_requirement();
+      CHECK(object->size() == (shadow.bytes().size() + unit - 1) / unit * unit);
+    }
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
   }
 }
@@ -526,7 +535,10 @@ TEST_CASE("cufile device writes round-trip on every path", "[io][cufile][write][
               size);
       shadow.write(offset, bytes);
     }
-    CHECK(object->size() == (shadow.bytes().size() + 4095) / 4096 * 4096);
+    {
+      auto const unit = ctx->write_alignment_requirement();
+      CHECK(object->size() == (shadow.bytes().size() + unit - 1) / unit * unit);
+    }
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
   }
 }

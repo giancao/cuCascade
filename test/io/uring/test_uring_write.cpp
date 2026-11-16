@@ -632,14 +632,19 @@ TEST_CASE("uring host_write round-trips aligned and unaligned ranges", "[io][uri
         shadow.write(at, bytes);
         // The backend is only handed whole blocks: a write that ends inside a block is
         // completed with zeros, so the file always ends on a block boundary.
-        CHECK(object->size() == (shadow.bytes().size() + 4095) / 4096 * 4096);
+        // Without O_DIRECT nothing changes: the file is exactly what was written.
+        CHECK(object->size() ==
+              (use_odirect ? block_padded(shadow.bytes()).size() : shadow.bytes().size()));
       }
     }
   }
-  auto expected = shadow.bytes();
-  expected.resize((expected.size() + 4095) / 4096 * 4096, 0);
-  CHECK(path.contents() == expected);
-  CHECK(read_back(ctx.get(), path.str()) == expected);
+  auto const expected = use_odirect ? block_padded(shadow.bytes()) : shadow.bytes();
+  CHECK((path.contents() == expected));
+  CHECK((read_back(ctx.get(), path.str()) == expected));
+  // Partial blocks are completed by the front end only for a backend that writes with O_DIRECT.
+  CHECK(ctx->write_alignment_requirement() == (use_odirect ? std::size_t{4096} : std::size_t{1}));
+  auto const stats = ctx->write_edge_stats();
+  CHECK((stats.merged_from_memory + stats.read_from_file + stats.zero_filled != 0) == use_odirect);
 }
 
 // Writes that do not cover whole blocks never reach the backend as such: the front end completes
