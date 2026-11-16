@@ -548,7 +548,7 @@ TEST_CASE("rest_ioctx keeps caller host buffers until the device event completes
   slices.emplace_back(
     cucascade::io::range{0, payload.size()},
     cucascade::io::host_buffer{host.get()},
-    cucascade::io::device_buffer{static_cast<std::uint8_t*>(destination.data()), stream});
+    cucascade::io::device_buffer{static_cast<std::uint8_t*>(destination.data()), stream.value()});
   auto future = ioctx->host_device_readv_async_io(*object, std::move(slices));
   REQUIRE(std::move(future).get(5s) == payload.size());
   std::memset(host.get(), 0, payload.size());

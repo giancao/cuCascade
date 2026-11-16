@@ -1,0 +1,4 @@
+[submodule "kvikio"]
+	path = kvikio
+	url = https://github.com/giancao/kvikio.git
+	branch = feat-unify-io-poc

@@ -109,8 +109,8 @@ std::shared_ptr<rest_ioctx> make_ctx(loopback_range_server const& server,
       auth = std::make_shared<s3::sigv4_header_authorizer>(creds, "us-east-1", server.endpoint());
       break;
   }
-  auto ctx = std::make_shared<rest_ioctx>(
-    1, std::make_shared<rest_reactor::reactor_context>(cfg, auth, nullptr));
+  auto ctx =
+    std::make_shared<rest_ioctx>(1, cucascade::io::rest::make_reactor_context(cfg, auth, nullptr));
   ctx->start();
   return ctx;
 }
@@ -419,7 +419,7 @@ TEST_CASE("cache identity conditions reads of a batch-resolved object on its foo
   cfg.footer_resolve_stash_budget = 4 * 512;
   auto authorizer = std::make_shared<list_capable_mock_authorizer>(server.endpoint());
   auto ctx        = std::make_shared<rest_ioctx>(
-    1, std::make_shared<rest_reactor::reactor_context>(cfg, authorizer, nullptr));
+    1, cucascade::io::rest::make_reactor_context(cfg, authorizer, nullptr));
   ctx->start();
 
   std::vector<std::string> const paths{"s3://bucket/a.parquet", "s3://bucket/b.parquet"};
@@ -475,7 +475,7 @@ TEST_CASE("cache identity conditions reads of a batch object resolved by HEAD fa
   cfg.footer_resolve_stash_budget = 4 * 512;
   auto authorizer = std::make_shared<list_capable_mock_authorizer>(server.endpoint());
   auto ctx        = std::make_shared<rest_ioctx>(
-    1, std::make_shared<rest_reactor::reactor_context>(cfg, authorizer, nullptr));
+    1, cucascade::io::rest::make_reactor_context(cfg, authorizer, nullptr));
   ctx->start();
 
   std::vector<std::string> const paths{"s3://bucket/fallback.parquet"};

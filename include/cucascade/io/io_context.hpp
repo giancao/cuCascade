@@ -37,15 +37,11 @@
 
 namespace cucascade::io {
 
-enum class io_context_type { uring, restful, s3rdma, cufile };
+/// What serves an io context. @c cufile_posix is kvikIO's built-in engine for
+/// local files (cuFile where available, POSIX otherwise), behind @c engine_ioctx.
+enum class io_context_type { uring, restful, s3rdma, cufile, cufile_posix };
 
-/// Hint passed to @c open_io_object so a backend can tailor how it resolves an
-/// object's metadata.  @c generic resolves the size however is cheapest for the
-/// scheme (a HEAD for object stores).  @c parquet_footer_probe asks the backend
-/// to resolve the size *and* stash the object's trailing bytes in one
-/// round-trip (a suffix-range GET), so the parquet footer reads that follow are
-/// served locally instead of costing extra round-trips.
-enum class open_hint { generic, parquet_footer_probe };
+// open_hint (generic, parquet_footer_probe) is kvikIO's; see cucascade/io/types.hpp.
 
 namespace cache {
 class fs_cache;
@@ -360,6 +356,9 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
 
   // -- Writes -------------------------------------------------------------------
   //
+  // Unified IO POC: object deletion (ioctx::remove_io_object, upstream PR #222) is
+  // not merged into this branch, so there is no delete entry point here.
+  //
   // The write entry points callers should use.  They validate, drop everything
   // the prefetching cache and the metadata store hold for the object's path
   // (again once the write settled, before the future resolves, so a prefetch
@@ -611,6 +610,50 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     if (object != nullptr) _metadata_store.stamp(*object);
     return object;
   }
+
+  // -- Writes that do not cover whole blocks ---------------------------------
+  //
+  // Only for a backend that writes with O_DIRECT: @ref write_alignment_requirement
+  // is above 1 exactly then. Any other backend gets every write as the caller
+  // made it.
+  //
+  // O_DIRECT writes whole blocks, each from one piece of memory, and writing
+  // the rest of a file through the page cache instead can leave stale pages
+  // there. So such a backend is handed whole blocks only, and a request is
+  // judged as a whole, not slice by slice:
+  //
+  //  1. Every block the request touches must be written from its first byte
+  //     on, without holes. In particular the request starts on a block
+  //     boundary: the bytes in front of it are never made up.
+  //  2. Its slices need not be aligned. A block that takes its bytes from more
+  //     than one slice (a header followed by payloads, say) is assembled in
+  //     host memory and written with the rest, in the same request.
+  //  3. The request may stop before the end of a block (the end of a buffer,
+  //     the end of the file) only where the file has no data: the rest of the
+  //     block is zeros, and the file ends on a block boundary.
+  //  4. Anything else fails with std::invalid_argument before anything is
+  //     written.
+  //
+  // Nothing is read from the file, nothing is kept between requests, and no
+  // lock is taken. The caller records how long its data is.
+
+ public:
+  /// The unit a write must start on and cover whole multiples of for the backend
+  /// to write it directly. Above 1 only when the backend writes with O_DIRECT;
+  /// 1 (the default) means writes have no alignment requirement.
+  [[nodiscard]] virtual std::size_t write_alignment_requirement() const noexcept { return 1; }
+
+ private:
+  struct write_edge_state;
+  std::unique_ptr<write_edge_state> _write_edges;
+
+ public:
+  /// What the front end did for requests that were not block aligned.
+  struct write_edge_counters {
+    std::uint64_t gathered_blocks{0};  ///< blocks assembled from the ends of slices
+    std::uint64_t padded_blocks{0};    ///< of those, last blocks completed with zeros
+  };
+  [[nodiscard]] write_edge_counters write_edge_stats() const noexcept;
 };
 
 }  // namespace cucascade::io

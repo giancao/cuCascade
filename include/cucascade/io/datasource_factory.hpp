@@ -128,6 +128,10 @@ class io_context_registry {
   /// is no catch-all backend).
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
+  /// The backend that serves local regular files under the configured
+  /// @c backend (see @c lookup_path): what a host builds as its local context.
+  [[nodiscard]] io_context_type local_type() const noexcept { return _local_type; }
+
   std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
 
   /**
@@ -144,10 +148,11 @@ class io_context_registry {
   };
   const config_type _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
-  /// Set when @c backend=cufile: the cuFile / GDS reactor then serves local
-  /// files instead of uring.  @c s3:// objects still go to REST -- the cuFile
-  /// backend is local-disk only.
-  bool _prefer_cufile{false};
+  /// The one backend that serves local files, chosen by @c backend: uring for
+  /// @c native, the cuFile reactor for @c cufile, kvikIO's engine for
+  /// @c cufile_posix.  The other local backends are skipped.  @c s3:// objects
+  /// go to REST in every case.
+  io_context_type _local_type{io_context_type::uring};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
   /// Set by the first @c lookup_path; @c replace_ioctx refuses afterwards

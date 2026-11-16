@@ -531,7 +531,7 @@ TEST_CASE("cufile ioctx reads device destinations", "[io][cufile][gpu]")
       slices.emplace_back(
         range{offset, size},
         host_buffer{host.data()},
-        cucascade::io::device_buffer{static_cast<std::uint8_t*>(dst.data()), stream});
+        cucascade::io::device_buffer{static_cast<std::uint8_t*>(dst.data()), stream.value()});
       REQUIRE(ioctx.get().host_device_readv_async_io(*object, std::move(slices)).get(30s) == size);
       CHECK(matches_file(host, offset, size));
       CHECK(matches_file(device_bytes(dst, size, stream), offset, size));
@@ -910,8 +910,9 @@ TEST_CASE("cufile settles a parked device slice at once when a sibling slice fai
   hold_stream(held.value(), std::chrono::milliseconds{3000});
 
   std::vector<prepared_io_slice> slices;
-  slices.emplace_back(range{0, size},
-                      cucascade::io::device_buffer{static_cast<std::uint8_t*>(dst.data()), held});
+  slices.emplace_back(
+    range{0, size},
+    cucascade::io::device_buffer{static_cast<std::uint8_t*>(dst.data()), held.value()});
   host_buffer null_host;
   null_host.buffer = static_cast<std::uint8_t*>(nullptr);
   slices.emplace_back(range{0, 4096}, std::move(null_host));
@@ -997,7 +998,7 @@ TEST_CASE("cufile reads that fail after enqueuing a copy settle only once it lan
     slices.emplace_back(
       range{0, size},
       host_buffer{host},
-      cucascade::io::device_buffer{static_cast<std::uint8_t*>(dst.data()), stream});
+      cucascade::io::device_buffer{static_cast<std::uint8_t*>(dst.data()), stream.value()});
     CHECK_THROWS(ioctx.get().host_device_readv_async_io(*object, std::move(slices)).get(30s));
     CHECK(matches_file(std::vector<std::uint8_t>(host, host + size), 0, size));
     CHECK(matches_file(device_bytes_elsewhere(dst.data(), size), 0, size));
@@ -1172,7 +1173,7 @@ class completion_log {
                         host_buffer{destination.data() + i * slice_bytes});
     slices.back().priority    = priority;
     slices.back().on_complete = std::make_shared<prepared_io_completion>(
-      [&log, tag, i, first_slice_hook](std::span<cucascade::io::cache::cached_chunk* const>,
+      [&log, tag, i, first_slice_hook](std::span<cucascade::io::fragment_handle const>,
                                        bool) noexcept {
         if (i == 0 && first_slice_hook) first_slice_hook();
         log.record(tag + std::to_string(i));
@@ -1447,9 +1448,7 @@ TEST_CASE("cufile throughput probe", "[.cufile-bench]")
     cucascade::memory::fixed_size_host_memory_resource mr{
       0, upstream, 2UL << 30, 2UL << 30, 1UL << 20, 128, 8};
     cucascade::io::uring::uring_ioctx ioctx{
-      reactors,
-      std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
-        cucascade::io::uring::config{}, &mr)};
+      reactors, cucascade::io::uring::make_reactor_context(cucascade::io::uring::config{}, &mr)};
     ioctx.start();
     run_probe("uring", ioctx, path, file_bytes, rounds);
     ioctx.shutdown();

@@ -83,7 +83,7 @@ TEST_CASE("physical completion publishes cache state before the future", "[io][c
   io_op_request operation;
   operation.coordinator = coordinator;
   operation.on_complete = std::make_shared<prepared_io_completion>(
-    [&](std::span<cucascade::io::cache::cached_chunk* const>, bool success) noexcept {
+    [&](std::span<cucascade::io::fragment_handle const>, bool success) noexcept {
       // Sampled inside the callback: the future must still be pending here.
       callback_ran.store(success && !future.is_ready(), std::memory_order_release);
     });
@@ -102,7 +102,7 @@ TEST_CASE("host-valid data is publishable even when its device copy fails", "[io
   io_op_request operation;
   operation.coordinator = coordinator;
   operation.on_complete = std::make_shared<prepared_io_completion>(
-    [&](std::span<cucascade::io::cache::cached_chunk* const>, bool success) noexcept {
+    [&](std::span<cucascade::io::fragment_handle const>, bool success) noexcept {
       host_data_valid.store(success, std::memory_order_release);
     });
   operation.finish_error(std::make_exception_ptr(std::runtime_error("H2D event failed")), true);

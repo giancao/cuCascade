@@ -18,19 +18,25 @@ if(cuCascade_cudf_FOUND AND "cudf" IN_LIST cuCascade_FIND_COMPONENTS)
   find_dependency(cudf REQUIRED CONFIG)
 endif()
 
-# The optional cucascade-io library (uring/rest reactors, prefetching cache) is
-# resolved lazily via the `io` package component, mirroring the cudf component
-# above. The io core is cudf-free. The exported io targets reference the
-# PkgConfig::LIBURING imported target by name, so it is reconstructed here with
-# the same pkg_check_modules call used at build time. The cudf component also
-# needs it when io was built: cucascade_cudf links cucascade_io for the
-# cudf::io::datasource bridge.
+# The optional cucascade-io library (the ioctx facade over kvikIO's engines, the
+# prefetching cache) is resolved lazily via the `io` package component,
+# mirroring the cudf component above. The io core is cudf-free and needs only
+# kvikIO. The cudf component also needs it when io was built: cucascade_cudf
+# links cucascade_io for the cudf::io::datasource bridge, and its static
+# library references the PkgConfig::LIBURING imported target by name (the DISK
+# tier probes io_uring), so that target is reconstructed here with the same
+# pkg_check_modules call used at build time.
 set(cuCascade_io_FOUND @CUCASCADE_BUILD_IO@)
 if(cuCascade_io_FOUND AND ("io" IN_LIST cuCascade_FIND_COMPONENTS
                            OR "cudf" IN_LIST cuCascade_FIND_COMPONENTS))
-  find_dependency(PkgConfig REQUIRED)
-  pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-  find_dependency(OpenSSL REQUIRED)
+  if("cudf" IN_LIST cuCascade_FIND_COMPONENTS)
+    find_dependency(PkgConfig REQUIRED)
+    pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
+  endif()
+  set(cuCascade_USE_KVIKIO @CUCASCADE_USE_KVIKIO@)
+  if(cuCascade_USE_KVIKIO)
+    find_dependency(kvikio REQUIRED CONFIG)
+  endif()
 
   # Best-effort check that the moodycamel headers the installed io headers
   # include are reachable. They are not shipped (the consumer provides the same

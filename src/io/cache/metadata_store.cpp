@@ -68,12 +68,12 @@ std::atomic<std::uint64_t>& metadata_store::epoch_of(std::string_view object_pat
 
 void metadata_store::stamp(io_object& obj) const noexcept
 {
-  obj._metadata_epoch = epoch_of(obj.object_path()).load(std::memory_order_acquire);
+  obj.set_client_tag(epoch_of(obj.object_path()).load(std::memory_order_acquire));
 }
 
 bool metadata_store::predates_write(io_object const& obj) const noexcept
 {
-  return obj._metadata_epoch != epoch_of(obj.object_path()).load(std::memory_order_acquire);
+  return obj.client_tag() != epoch_of(obj.object_path()).load(std::memory_order_acquire);
 }
 
 void metadata_store::invalidate_written(std::string_view object_path) noexcept
@@ -159,7 +159,7 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(io_object const&
   // parse of the bytes before it, even when the write left the stat identity
   // unchanged.
   auto const flight_key =
-    std::to_string(obj._metadata_epoch) + ":" + cache_key(identity.cache_key(locator), lookup);
+    std::to_string(obj.client_tag()) + ":" + cache_key(identity.cache_key(locator), lookup);
   std::shared_ptr<flight> work;
   {
     std::unique_lock lock{_mutex};
@@ -167,7 +167,7 @@ std::shared_ptr<io_object_metadata> metadata_store::get_or_load(io_object const&
     // advances the epoch before it erases the path's entries.
     auto found = _index.find(lookup);
     if (found != _index.end() && found->second->identity == identity &&
-        found->second->locator == locator && found->second->epoch == obj._metadata_epoch) {
+        found->second->locator == locator && found->second->epoch == obj.client_tag()) {
       ++_stats.hits;
       if (cache_hit) *cache_hit = true;
       return found->second->value;
@@ -376,7 +376,7 @@ void metadata_store::register_metadata(io_object const& obj,
                locator,
                std::move(identity),
                obj.open_generation(),
-               obj._metadata_epoch,
+               obj.client_tag(),
                payload,
                profile,
                retired);
@@ -391,7 +391,7 @@ std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const
   std::lock_guard lock{_mutex};
   auto const found = _index.find(lookup);
   if (found != _index.end() && found->second->identity == identity &&
-      found->second->locator == locator && found->second->epoch == obj._metadata_epoch) {
+      found->second->locator == locator && found->second->epoch == obj.client_tag()) {
     ++_stats.hits;
     return found->second->value;
   }

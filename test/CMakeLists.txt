@@ -89,6 +89,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     cucascade_io_tests
     io/test_datasource_registry.cpp
     io/test_dispatch_failure_hook.cpp
+    io/test_engine_ioctx.cpp
     io/test_io_utils.cpp
     io/test_object_identity.cpp
     io/test_semi_future_callback.cpp
@@ -104,6 +105,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/test_object_store_lister.cpp
     io/rest/test_rest_cache_identity.cpp
     io/rest/test_rest_footer_resolve.cpp
+    io/rest/test_rest_curl_fallback.cpp
     io/rest/test_rest_https.cpp
     io/rest/test_rest_pool_parity.cpp
     io/rest/test_rest_pool_plan.cpp
@@ -116,6 +118,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
     io/rest/s3/test_static_credentials.cpp
     io/rest/net/test_net_dns.cpp
     io/rest/net/test_net_transport.cpp
+    io/uring/test_uring_allocations.cpp
     io/uring/test_uring_readv.cpp
     io/uring/test_uring_write.cpp
     # Utils
@@ -135,6 +138,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   # Tests of the io_uring REST transport modules.
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/tls/tests.cmake)
   include(${CMAKE_CURRENT_SOURCE_DIR}/io/rest/http/tests.cmake)
+  if(CUCASCADE_USE_KVIKIO)
+    target_sources(cucascade_io_tests PRIVATE io/test_kvikio_dependency.cpp)
+    target_compile_definitions(
+      cucascade_io_tests
+      PRIVATE CUCASCADE_TEST_KVIKIO_LIBRARY="$<TARGET_FILE:kvikio::kvikio>")
+  endif()
   # Tests of src-private helpers (io/detail/..., the transport modules) include
   # them from src/.
   target_include_directories(cucascade_io_tests
@@ -161,6 +170,23 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
 
   target_link_libraries(cucascade_io_tests PRIVATE cucascade_io Catch2::Catch2
                                                    CUDA::cudart_static)
+  # The tests of the REST layers use OpenSSL (TLS servers and PKI) and liburing
+  # directly; the io library no longer brings them.
+  target_link_libraries(cucascade_io_tests PRIVATE PkgConfig::LIBURING
+                                                   OpenSSL::SSL OpenSSL::Crypto)
+  # The uring tests drive the reactor classes directly, which live in kvikIO's
+  # io_uring engine plugin.
+  target_link_libraries(cucascade_io_tests PRIVATE kvikio::engine_uring
+                                                   kvikio::engine_uring_http)
+  # The tests of the REST layers (HTTP codec, network transport, TLS) include
+  # kvikIO's private headers and name them through cucascade::io; this header
+  # makes those names resolve in every test file.
+  target_compile_options(cucascade_io_tests
+                         PRIVATE -include cucascade/io/rest/forward.hpp)
+  if(TARGET kvikio_engine_cufile_reactor)
+    target_link_libraries(cucascade_io_tests
+                          PRIVATE kvikio::engine_cufile_reactor)
+  endif()
 
   add_test(NAME cucascade_io_tests COMMAND cucascade_io_tests)
 endif()
@@ -196,6 +222,12 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
               cudf/test_dispose_eviction.cpp
               cudf/test_explicit_eviction.cpp
               cudf/test_write_cache_invalidation.cpp)
+    if(CUCASCADE_USE_KVIKIO)
+      target_sources(cucascade_cudf_tests PRIVATE io/test_kvikio_dependency.cpp)
+      target_compile_definitions(
+        cucascade_cudf_tests
+        PRIVATE CUCASCADE_TEST_KVIKIO_LIBRARY="$<TARGET_FILE:kvikio::kvikio>")
+    endif()
   endif()
 
   set_target_properties(cucascade_cudf_tests
@@ -211,6 +243,19 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
     cucascade_cudf_tests
     PRIVATE cucascade_cudf Catch2::Catch2 CUDA::cudart_static
             cudf::cudftest_default_stream)
+  if(CUCASCADE_BUILD_IO)
+    # test/utils/disk_test_utils.hpp probes io_uring with liburing; the loopback
+    # object-store server of the datasource tests uses OpenSSL.
+    target_link_libraries(
+      cucascade_cudf_tests PRIVATE PkgConfig::LIBURING OpenSSL::SSL
+                                   OpenSSL::Crypto)
+  endif()
+  # test_cache_object_identity builds a REST context from its own reactor
+  # context, which creates kvikIO's uring_http engine directly.
+  if(TARGET kvikio_engine_uring_http)
+    target_link_libraries(cucascade_cudf_tests
+                          PRIVATE kvikio::engine_uring_http)
+  endif()
 
   # Register tests with CTest
   add_test(NAME cucascade_cudf_tests COMMAND cucascade_cudf_tests)

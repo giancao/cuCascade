@@ -173,7 +173,7 @@ class spp_reactor {
     std::size_t slices_per_pass,
     std::size_t low_service_interval = cucascade::io::uring::config{}.low_service_interval)
     : _mr{0, _upstream, capacity, capacity, block_size, 64, 0},
-      _reactor{std::make_shared<uring_reactor::reactor_context>(
+      _reactor{cucascade::io::uring::make_reactor_context(
                  config_for(slices_per_pass, low_service_interval), &_mr),
                ""}
   {
@@ -260,7 +260,7 @@ class worker_plug {
   [[nodiscard]] std::shared_ptr<prepared_io_completion> completion() const
   {
     return std::make_shared<prepared_io_completion>(
-      [state = _state](std::span<cached_chunk* const>, bool) noexcept {
+      [state = _state](std::span<cucascade::io::fragment_handle const>, bool) noexcept {
         state->entered.fetch_add(1);
         auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         while (!state->released.load() && std::chrono::steady_clock::now() < deadline) {
@@ -480,17 +480,17 @@ TEST_CASE("io_uring cache callback precedes its coordinator credit", "[io][uring
   bool callback_success      = false;
   cached_chunk* observed     = nullptr;
   auto completion            = std::make_shared<prepared_io_completion>(
-    [&](std::span<cached_chunk* const> chunks, bool success) noexcept {
+    [&](std::span<cucascade::io::fragment_handle const> chunks, bool success) noexcept {
       ++callback_count;
       credits_seen     = coordinator->tasks_remaining();
       callback_success = success;
-      if (chunks.size() == 1) observed = chunks.front();
+      if (chunks.size() == 1) observed = cucascade::io::cache::chunk_of(chunks.front());
     });
 
   auto op                 = std::make_unique<uring_io_op>();
   op->request.coordinator = coordinator;
   op->request.on_complete = completion;
-  op->request.completion_chunks.push_back(&chunk);
+  op->request.completion_handles.push_back(&chunk);
 
   op->request.finish_success();
   op->request.finish_success();
@@ -515,11 +515,11 @@ TEST_CASE("io_uring physical expansion publishes cache fragments independently",
   bool callbacks_valid        = true;
 
   auto completion = std::make_shared<prepared_io_completion>(
-    [&](std::span<cached_chunk* const> chunks, bool success) noexcept {
+    [&](std::span<cucascade::io::fragment_handle const> chunks, bool success) noexcept {
       callbacks_valid =
         callbacks_valid && success && chunks.size() == 1 && published_count < published.size();
       if (chunks.size() == 1 && published_count < published.size()) {
-        published[published_count++] = chunks.front();
+        published[published_count++] = cucascade::io::cache::chunk_of(chunks.front());
       }
     });
 
@@ -527,7 +527,7 @@ TEST_CASE("io_uring physical expansion publishes cache fragments independently",
     auto op                 = std::make_unique<uring_io_op>();
     op->request.coordinator = coordinator;
     op->request.on_complete = completion;
-    op->request.completion_chunks.push_back(chunk);
+    op->request.completion_handles.push_back(chunk);
     return op;
   };
 
@@ -552,13 +552,14 @@ TEST_CASE("io_uring CUDA-stage failure may publish valid host data before error"
   auto future      = coordinator->get_future();
   bool host_valid  = false;
 
-  auto completion = std::make_shared<prepared_io_completion>(
-    [&](std::span<cached_chunk* const>, bool success) noexcept { host_valid = success; });
+  auto completion =
+    std::make_shared<prepared_io_completion>([&](std::span<cucascade::io::fragment_handle const>,
+                                                 bool success) noexcept { host_valid = success; });
 
   auto op                 = std::make_unique<uring_io_op>();
   op->request.coordinator = coordinator;
   op->request.on_complete = completion;
-  op->request.finish_error(cudaErrorInvalidValue, true);
+  op->request.finish_error(CUDA_ERROR_INVALID_VALUE, true);
 
   CHECK(host_valid);
   CHECK_THROWS(std::move(future).get());
@@ -650,7 +651,7 @@ TEST_CASE("io_uring staging reservation follows the byte budget, not the slot ca
   cucascade::memory::fixed_size_host_memory_resource mr{
     0, upstream, capacity, capacity, block_size, 4, 0};
 
-  auto ctx = std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr);
+  auto ctx = cucascade::io::uring::make_reactor_context(cucascade::io::uring::config{}, &mr);
   uring_reactor reactor{ctx, ""};
 
   REQUIRE_NOTHROW(reactor.start());
@@ -668,7 +669,7 @@ TEST_CASE("io_uring staging failure names the reactor and the requested bytes", 
   cucascade::memory::fixed_size_host_memory_resource mr{
     0, upstream, 1UL << 20, 1UL << 20, block_size, 1, 0};
 
-  auto ctx = std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr);
+  auto ctx = cucascade::io::uring::make_reactor_context(cucascade::io::uring::config{}, &mr);
   uring_reactor reactor{ctx, ""};
 
   REQUIRE_THROWS_WITH(
@@ -700,8 +701,7 @@ TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[io][uring
       cucascade::memory::fixed_size_host_memory_resource mr{
         0, upstream, capacity, capacity, block_size, 4, 0};
 
-      auto ctx =
-        std::make_shared<uring_reactor::reactor_context>(cucascade::io::uring::config{}, &mr);
+      auto ctx = cucascade::io::uring::make_reactor_context(cucascade::io::uring::config{}, &mr);
       uring_reactor reactor{ctx, ""};
       reactor.start();
       reactor.shutdown();
@@ -720,7 +720,7 @@ TEST_CASE("io_uring cancels rejected work outside the enqueue lock", "[io][uring
       };
 
       auto reenter = std::make_shared<prepared_io_completion>(
-        [&](std::span<cached_chunk* const>, bool) noexcept {
+        [&](std::span<cucascade::io::fragment_handle const>, bool) noexcept {
           *inner_canceled = canceled(submit(nullptr));
         });
 
@@ -1286,7 +1286,7 @@ class ioctx_staging {
 
   explicit ioctx_staging(std::size_t n_reactors, cucascade::io::uring::config cfg = {})
     : _mr{0, _upstream, n_reactors * (128UL << 20), n_reactors * (128UL << 20), block_size, 64, 0},
-      _ctx{std::make_shared<uring_reactor::reactor_context>(cfg, &_mr)}
+      _ctx{cucascade::io::uring::make_reactor_context(cfg, &_mr)}
   {
   }
 
@@ -1328,7 +1328,8 @@ TEST_CASE("io_uring ioctx reads a range-batched host read end to end",
     ioctx_staging staging{n_reactors};
     uring_ioctx ioctx{n_reactors, staging.context()};
     ioctx.start();
-    REQUIRE(ioctx.range_batch_slices() == 8);
+    REQUIRE(dynamic_cast<kvikio::io::uring::uring_engine&>(ioctx.engine()).range_batch_slices() ==
+            8);
 
     std::vector<cucascade::io::slice> slices;
     for (auto const& r : ranges) {

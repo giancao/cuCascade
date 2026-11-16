@@ -22,14 +22,22 @@
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
 #include <cucascade/io/cufile/platform.hpp>
 #endif
+#include <cucascade/io/engine_ioctx.hpp>
+#include <cucascade/io/host_staging_source.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/log/logging.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
+#include <kvikio/io/cufile_posix_engine.hpp>
+#include <kvikio/io/engine_registry.hpp>
+#include <kvikio/io/errors.hpp>
+#include <kvikio/io/uring/uring_engine.hpp>
+
 #include <liburing.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -52,8 +60,7 @@ constexpr std::size_t uring_staging_block_size = 1UL << 20;
 /**
  * @brief The pinned staging a private uring context owns.
  *
- * A base class of owning_uring_reactor_context so it is constructed before, and destroyed after,
- * the reactor_context that points at it (base-from-member).
+ * A base class of owned_engine_staging, so the upstream is constructed before the resource.
  */
 class owned_uring_staging {
  protected:
@@ -73,22 +80,6 @@ class owned_uring_staging {
 
   memory::numa_region_pinned_host_memory_resource _upstream;
   memory::fixed_size_host_memory_resource _staging;
-};
-
-/**
- * @brief A uring reactor_context that owns its pinned staging resource.
- *
- * Every reactor of the pool holds the shared reactor_context and releases its bounce blocks
- * before dropping it, so the staging resource outlives every block taken from it without the
- * ioctx having to know about it.
- */
-class owning_uring_reactor_context final : private owned_uring_staging,
-                                           public io::uring::uring_reactor::reactor_context {
- public:
-  owning_uring_reactor_context(io::uring::config const& cfg, std::size_t n_reactors, int numa_node)
-    : owned_uring_staging(n_reactors, numa_node), reactor_context(cfg, &_staging)
-  {
-  }
 };
 
 /**
@@ -154,6 +145,29 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
   }
 }
 
+/**
+ * @brief Pinned staging owned by a private engine.
+ *
+ * The engine holds this source for as long as it lives, so the blocks outlive every lease.
+ */
+class owned_engine_staging final : public kvikio::io::staging_source, private owned_uring_staging {
+ public:
+  owned_engine_staging(std::size_t n_threads, int numa_node)
+    : owned_uring_staging(n_threads, numa_node), _source(_staging)
+  {
+  }
+
+  [[nodiscard]] std::size_t block_size() const noexcept override { return _source.block_size(); }
+
+  [[nodiscard]] kvikio::io::staging_result acquire(std::size_t bytes) noexcept override
+  {
+    return _source.acquire(bytes);
+  }
+
+ private:
+  io::host_staging_source _source;
+};
+
 [[nodiscard]] std::shared_ptr<io::ioctx> build_context(disk_io_context_options const& options,
                                                        disk_io_backend backend)
 {
@@ -162,20 +176,36 @@ void validate(disk_io_context_options const& options, disk_io_backend backend)
   switch (backend) {
     case disk_io_backend::cufile: {
 #ifdef CUCASCADE_HAS_CUFILE
-      auto reactor_ctx = std::make_shared<io::cufile::cufile_reactor::reactor_context>(cfg.cufile);
-      return std::make_shared<io::cufile::cufile_ioctx>(cfg.cufile_n_reactors,
-                                                        std::move(reactor_ctx));
+      // A private engine, not the one selected for scans.
+      return io::cufile::make_private_cufile_ioctx(cfg.cufile_n_reactors, cfg.cufile);
 #else
       throw std::invalid_argument(
         "make_disk_io_context: the cufile backend was requested but this build has no cufile.h");
 #endif
     }
+    case disk_io_backend::cufile_posix: {
+      // A private engine, not the one selected for scans in kvikIO's registry.
+      auto const n_threads = std::max<std::size_t>(1, cfg.cufile_posix_n_threads);
+      kvikio::io::cufile_posix_options engine_options;
+      engine_options.num_threads = static_cast<unsigned int>(n_threads);
+      engine_options.staging =
+        std::make_shared<owned_engine_staging>(n_threads, options.staging_numa_node);
+      auto engine = kvikio::io::make_cufile_posix_engine(engine_options);
+      engine->start();
+      return std::make_shared<io::engine_ioctx>(std::move(engine),
+                                                io::io_context_type::cufile_posix);
+    }
     case disk_io_backend::uring:
     case disk_io_backend::automatic: break;
   }
-  auto reactor_ctx = std::make_shared<owning_uring_reactor_context>(
-    cfg.uring, cfg.uring_n_reactors, options.staging_numa_node);
-  return std::make_shared<io::uring::uring_ioctx>(cfg.uring_n_reactors, std::move(reactor_ctx));
+  // A private engine with its own pinned staging, not the one selected for scans.
+  kvikio::io::uring::uring_options engine_options;
+  engine_options.n_reactors = cfg.uring_n_reactors;
+  engine_options.cfg        = cfg.uring;
+  engine_options.staging =
+    std::make_shared<owned_engine_staging>(cfg.uring_n_reactors, options.staging_numa_node);
+  return std::make_shared<io::uring::uring_ioctx>(kvikio::io::engine_registry::instance().create(
+    kvikio::io::uring::uring_engine_name, engine_options));
 }
 
 }  // namespace
@@ -198,13 +228,19 @@ bool gds_is_available() noexcept
 std::shared_ptr<io::ioctx> make_disk_io_context(disk_io_context_options const& options)
 {
   auto const backend = resolve_backend(options.backend);
-  auto context       = build_context(options, backend);
-  if (!context) {
-    throw std::runtime_error("make_disk_io_context: failed to build the io context");
-  }
+  std::shared_ptr<io::ioctx> context;
   try {
+    // The uring engine starts its reactors when it is created.
+    context = build_context(options, backend);
+    if (!context) {
+      throw std::runtime_error("make_disk_io_context: failed to build the io context");
+    }
     context->start();
-  } catch (std::system_error const& error) {
+  } catch (std::exception const& error) {
+    bool const cannot_start =
+      dynamic_cast<std::system_error const*>(&error) != nullptr ||
+      dynamic_cast<kvikio::io::engine_selection_error const*>(&error) != nullptr;
+    if (!cannot_start) { throw; }
 #ifdef CUCASCADE_HAS_CUFILE
     // The one-entry probe passed, but a reactor could not set up its own ring
     // (larger depth, setup flags, memlock limits): for automatic that is still

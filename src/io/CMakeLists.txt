@@ -17,34 +17,17 @@
 
 target_sources(
   cucascade_io_objects
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/uri_parser.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/io_context.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/engine_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/datasource_factory.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/object_identity.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/detail/local_descriptor.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/config.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/object_store_lister.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/reactor_placement.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_ioctx.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/rest_reactor.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/shared_services.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma/s3rdma_ioctx.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_ioctx.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/uring/uring_reactor.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sigv4.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/sigv4_authorizer.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/rest/s3/list_parser.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/types.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/metadata_store.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cache/fs_cache.cpp)
 
-# Modules of the io_uring REST transport.  Each fragment adds its own sources to
-# cucascade_io_objects.
-target_sources(cucascade_io_objects
-               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rest/errc.cpp)
-include(${CMAKE_CURRENT_SOURCE_DIR}/tls/sources.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/rest/http/sources.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/rest/net/sources.cmake)
+# The REST engine (reactor, HTTP codec, network transport, TLS, S3 signing) lives
+# in kvikIO's uring_http engine plugin; rest/rest_ioctx.cpp is the facade over it.
 
 # Sources include src-private headers (io/detail/..., the transport modules'
 # headers) from src/.
@@ -56,8 +39,6 @@ target_include_directories(cucascade_io_objects
 if(CUCASCADE_CUFILE_INCLUDE_DIR)
   target_sources(
     cucascade_io_objects
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_api.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_ioctx.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_reactor.cpp
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cufile/cufile_ioctx.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/cufile/platform.cpp)
 endif()

@@ -31,6 +31,8 @@
 
 #include <cucascade/cudf/datasource.hpp>
 #include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/engine_ioctx.hpp>
+#include <cucascade/io/host_staging_source.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
@@ -43,6 +45,9 @@
 #include <cudf/io/parquet_metadata.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/types.hpp>
+
+#include <kvikio/io/cufile_posix_engine.hpp>
+#include <kvikio/io/engine_registry.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -74,15 +79,16 @@ static const std::vector<std::string> COLUMNS = {
   "l_shipdate",
 };
 
-enum class Backend { io_context, cudf };
+enum class Backend { io_context, cufile_posix, cudf };
 enum class Dest { host, device };
 
 static Backend parse_backend(std::string_view s)
 {
   if (s == "io_context") return Backend::io_context;
+  if (s == "cufile_posix") return Backend::cufile_posix;
   if (s == "cudf") return Backend::cudf;
   throw std::invalid_argument(std::string("unknown backend: ") + std::string(s) +
-                              "  (expected: io_context | cudf)");
+                              "  (expected: io_context | cufile_posix | cudf)");
 }
 
 static Dest parse_dest(std::string_view s)
@@ -125,9 +131,10 @@ static std::vector<std::string> expand_paths(std::string const& spec)
 static void usage(char const* prog)
 {
   std::cerr << "usage: " << prog
-            << " <path|glob> <io_context|cudf> <host|device> <num_rows> [n_threads]\n"
+            << " <path|glob> <io_context|cufile_posix|cudf> <host|device> <num_rows> [n_threads]\n"
             << "  path|glob  – parquet file path, or shell glob (e.g. 'dir/*.parquet')\n"
             << "  io_context – native cucascade::io ioctx (host=vector-io, device=device_read)\n"
+            << "  cufile_posix – the same reads through kvikIO's built-in cufile_posix engine\n"
             << "  cudf       – cucascade::io::datasource per-range host_read/device_read_async\n"
             << "  host|device– destination tier the ranges are read into\n"
             << "  num_rows   – rows to read (0 = all)\n"
@@ -309,11 +316,23 @@ int main(int argc, char** argv)
                                                              CHUNKS_PER_SLAB,  // pool_size
                                                              1);               // initial_pools
 
-  auto uring_ctx = std::make_shared<cucascade::io::uring::uring_reactor::reactor_context>(
+  auto uring_ctx = cucascade::io::uring::make_reactor_context(
     cucascade::io::uring::uring_reactor::reactor_config_type{.use_odirect = true}, &host_mr);
-  std::shared_ptr<cucascade::io::ioctx> io_ctx =
-    std::make_shared<cucascade::io::uring::uring_ioctx>(n_threads, std::move(uring_ctx));
+  std::shared_ptr<cucascade::io::ioctx> io_ctx;
+  if (backend == Backend::cufile_posix) {
+    // kvikIO's built-in engine (cuFile where the system supports it, POSIX otherwise), with
+    // as many threads as the uring path has reactors and the same staging pool.
+    kvikio::io::cufile_posix_options options;
+    options.num_threads = static_cast<unsigned int>(n_threads);
+    options.staging     = std::make_shared<cucascade::io::host_staging_source>(host_mr);
+    io_ctx              = std::make_shared<cucascade::io::engine_ioctx>(
+      kvikio::io::engine_registry::instance().create(kvikio::io::cufile_posix_engine_name, options),
+      cucascade::io::io_context_type::cufile_posix);
+  } else {
+    io_ctx = std::make_shared<cucascade::io::uring::uring_ioctx>(n_threads, std::move(uring_ctx));
+  }
   io_ctx->start();
+  bool const native = backend != Backend::cudf;  // read through the ioctx, not a datasource
 
   // One handle per file for the native path, one datasource per file for the
   // cudf path.  Opening does one untimed open()/stat() per file; both are
@@ -321,7 +340,7 @@ int main(int argc, char** argv)
   // datasource state is inert).
   std::vector<std::shared_ptr<cucascade::io::io_object>> io_objects;
   std::vector<std::unique_ptr<cucascade::io::datasource>> datasources;
-  if (backend == Backend::io_context) {
+  if (native) {
     io_objects.reserve(paths.size());
     for (auto const& path : paths)
       io_objects.push_back(io_ctx->open_io_object(path));
@@ -378,7 +397,7 @@ int main(int argc, char** argv)
       workers.emplace_back([&, lo, hi] {
         rmm::cuda_stream stream;  // per-worker stream for device reads
 
-        if (backend == Backend::io_context && dest == Dest::host) {
+        if (native && dest == Dest::host) {
           // Vector I/O: one host_readv_async_io per file, over that file's
           // slices.  Slice vectors must outlive the futures.
           std::vector<std::vector<cucascade::io::slice>> seg_sets;
@@ -405,7 +424,7 @@ int main(int argc, char** argv)
           }
           for (auto& f : futs)
             std::move(f).get();
-        } else if (backend == Backend::io_context && dest == Dest::device) {
+        } else if (native && dest == Dest::device) {
           std::vector<cucascade::exec::semi_future<size_t>> futs;
           futs.reserve(hi - lo);
           for (size_t i = lo; i < hi; ++i) {

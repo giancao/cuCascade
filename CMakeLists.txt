@@ -126,6 +126,18 @@ set(CUCASCADE_MOODYCAMEL_NAMESPACE
     "moodycamel"
     CACHE STRING "C++ namespace of the moodycamel concurrentqueue headers")
 
+option(
+  CUCASCADE_USE_KVIKIO
+  "Link the cucascade-io library against kvikIO built from CUCASCADE_KVIKIO_SOURCE_DIR"
+  ON)
+
+set(CUCASCADE_KVIKIO_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/kvikio"
+    CACHE
+      PATH
+      "kvikIO source tree to build (default: the kvikio git submodule); empty links an existing kvikio::kvikio"
+)
+
 # The io core is cudf-free (the cudf::io::datasource bridge lives in the
 # cucascade-cudf bundle); it only requires a full (non-topology-only) build.
 if(CUCASCADE_BUILD_IO AND CUCASCADE_TOPOLOGY_ONLY)
@@ -135,6 +147,111 @@ if(CUCASCADE_BUILD_IO AND CUCASCADE_TOPOLOGY_ONLY)
       OFF
       CACHE BOOL "Build the cucascade-io library" FORCE)
 endif()
+
+if(CUCASCADE_USE_KVIKIO AND NOT CUCASCADE_BUILD_IO)
+  message(
+    STATUS "CUCASCADE_USE_KVIKIO disabled: requires CUCASCADE_BUILD_IO=ON")
+  set(CUCASCADE_USE_KVIKIO
+      OFF
+      CACHE BOOL "Link the cucascade-io library against kvikIO" FORCE)
+endif()
+
+# The io library is built on kvikIO: its future/promise types, byte ranges and
+# object identities are kvikIO's, and the I/O engines are moving there.
+if(CUCASCADE_BUILD_IO AND NOT CUCASCADE_USE_KVIKIO)
+  message(
+    FATAL_ERROR
+      "CUCASCADE_BUILD_IO=ON requires CUCASCADE_USE_KVIKIO=ON: cucascade-io uses kvikIO's exec and io headers. Enable CUCASCADE_USE_KVIKIO, or set CUCASCADE_BUILD_IO=OFF."
+  )
+endif()
+
+function(cucascade_add_kvikio)
+  if(NOT CUCASCADE_KVIKIO_SOURCE_DIR)
+    if(NOT TARGET kvikio::kvikio)
+      find_package(kvikio REQUIRED CONFIG)
+    endif()
+    message(STATUS "cucascade-io: linking the existing kvikio::kvikio target")
+    return()
+  endif()
+
+  if(TARGET kvikio::kvikio)
+    message(
+      FATAL_ERROR
+        "kvikio::kvikio is already defined, so kvikIO cannot be built from '${CUCASCADE_KVIKIO_SOURCE_DIR}'. Add cuCascade before the packages that import kvikIO (libcuvs does): their find_package(kvikio) is then served by this build. To link the existing target instead, set CUCASCADE_KVIKIO_SOURCE_DIR to an empty string."
+    )
+  endif()
+
+  if(NOT EXISTS "${CUCASCADE_KVIKIO_SOURCE_DIR}/cpp/CMakeLists.txt")
+    message(
+      FATAL_ERROR
+        "kvikIO sources not found in '${CUCASCADE_KVIKIO_SOURCE_DIR}'. Run `git submodule update --init kvikio`, point CUCASCADE_KVIKIO_SOURCE_DIR at a kvikIO checkout, or configure with -DCUCASCADE_USE_KVIKIO=OFF."
+    )
+  endif()
+
+  file(STRINGS "${CUCASCADE_KVIKIO_SOURCE_DIR}/VERSION" _kvikio_version
+       LIMIT_COUNT 1)
+  if(CUCASCADE_BUILD_CUDF
+     AND NOT _kvikio_version MATCHES
+         "^0*${cudf_VERSION_MAJOR}\\.0*${cudf_VERSION_MINOR}\\.")
+    message(
+      FATAL_ERROR
+        "kvikIO ${_kvikio_version} in '${CUCASCADE_KVIKIO_SOURCE_DIR}' does not match libcudf ${cudf_VERSION}: libcudf loads the same libkvikio.so, so both must be the same RAPIDS release. Use an environment with a matching libcudf, check out the matching kvikIO, or configure with -DCUCASCADE_USE_KVIKIO=OFF."
+    )
+  endif()
+  message(
+    STATUS
+      "cucascade-io: building kvikIO ${_kvikio_version} from '${CUCASCADE_KVIKIO_SOURCE_DIR}'"
+  )
+
+  set(BUILD_SHARED_LIBS ON)
+  set(KvikIO_REMOTE_SUPPORT ON)
+  # cucascade::exec::invocable is kvikio::exec::invocable, so kvikIO is built
+  # with the same backend as cuCascade and its host.
+  set(KvikIO_USE_ABSEIL_INVOCABLE ${CUCASCADE_USE_ABSEIL_INVOCABLE})
+  if(CUCASCADE_USE_ABSEIL_INVOCABLE)
+    set(KvikIO_ABSEIL_INVOCABLE_TARGET ${_cucascade_absl_target})
+  endif()
+  # The io_uring engine is a kvikIO plugin (libkvikio_engine_uring.so, next to
+  # libkvikio.so). It uses the same moodycamel copy as cuCascade.
+  set(KvikIO_BUILD_URING_ENGINE ON)
+  set(KvikIO_BUILD_CUFILE_REACTOR_ENGINE ON)
+  set(KvikIO_BUILD_URING_HTTP_ENGINE ON)
+  set(KvikIO_MOODYCAMEL_TARGET "${CUCASCADE_MOODYCAMEL_TARGET}")
+  set(KvikIO_MOODYCAMEL_INCLUDE_DIR "${CUCASCADE_MOODYCAMEL_INCLUDE_DIR}")
+  set(KvikIO_MOODYCAMEL_NAMESPACE "${CUCASCADE_MOODYCAMEL_NAMESPACE}")
+  set(KvikIO_BUILD_BENCHMARKS OFF)
+  set(KvikIO_BUILD_EXAMPLES OFF)
+  set(KvikIO_BUILD_NSYS_PLUGIN OFF)
+  set(KvikIO_BUILD_TESTS OFF)
+  set(_kvikio_binary_dir "${CMAKE_CURRENT_BINARY_DIR}/kvikio")
+  include(FetchContent)
+  FetchContent_Declare(
+    kvikio
+    SOURCE_DIR
+    "${CUCASCADE_KVIKIO_SOURCE_DIR}"
+    BINARY_DIR
+    "${_kvikio_binary_dir}"
+    SOURCE_SUBDIR
+    cpp
+    OVERRIDE_FIND_PACKAGE)
+  FetchContent_MakeAvailable(kvikio)
+
+  set(CUCASCADE_KVIKIO_LIBRARY_DIR
+      "${_kvikio_binary_dir}"
+      CACHE INTERNAL "Directory of the libkvikio.so built by cuCascade")
+
+  foreach(_kind EXE SHARED MODULE)
+    set(CMAKE_${_kind}_LINKER_FLAGS
+        "-Wl,-rpath,${_kvikio_binary_dir} ${CMAKE_${_kind}_LINKER_FLAGS}"
+        PARENT_SCOPE)
+  endforeach()
+
+  target_link_options(
+    cucascade_io_thirdparty
+    INTERFACE
+    "$<BUILD_INTERFACE:$<HOST_LINK:LINKER:--push-state$<COMMA>--no-as-needed$<COMMA>$<TARGET_FILE:kvikio>$<COMMA>--pop-state>>"
+  )
+endfunction()
 
 # The cudf layer's DISK-tier converters read and write spill files through the
 # io library's io_context, so a cudf build needs the io library.
@@ -201,13 +318,17 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     endif()
   endif()
 
-  # Third-party dependencies of the cucascade-io library (datasource layer)
+  # Third-party dependencies of the io layer. The io library itself needs only
+  # kvikIO: the engines that use liburing and OpenSSL are kvikIO plugins.
   if(CUCASCADE_BUILD_IO)
+    # liburing: the DISK tier (in the cudf library) probes whether this process
+    # may use io_uring, and so do the tests.
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-    # OpenSSL: TLS for the REST transport (handshakes, the user-space record
-    # layer's AES-GCM and key schedule) and SigV4's HMAC / SHA-256.
-    find_package(OpenSSL REQUIRED)
+    # OpenSSL: only the tests of the REST layers (TLS, the loopback servers).
+    if(CUCASCADE_BUILD_TESTS)
+      find_package(OpenSSL REQUIRED)
+    endif()
 
     # cuFile / GPUDirect Storage — the cufile reactor dlopen()s libcufile at run
     # time and needs only cufile.h to build (it ships with the CUDA toolkit;
@@ -276,7 +397,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
     target_compile_definitions(
       cucascade_io_thirdparty
       INTERFACE CUCASCADE_MOODYCAMEL_NAMESPACE=${CUCASCADE_MOODYCAMEL_NAMESPACE}
-    )
+                KVIKIO_MOODYCAMEL_NAMESPACE=${CUCASCADE_MOODYCAMEL_NAMESPACE})
 
     # cucascade::exec::invocable backend. When abseil is requested, reuse a
     # provided target, else an already-defined absl::any_invocable, else
@@ -300,6 +421,13 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY)
         INTERFACE $<BUILD_INTERFACE:${_cucascade_absl_target}>)
       target_compile_definitions(cucascade_io_thirdparty
                                  INTERFACE CUCASCADE_USE_ABSEIL_INVOCABLE)
+    endif()
+
+    unset(CUCASCADE_KVIKIO_LIBRARY_DIR CACHE)
+    if(CUCASCADE_USE_KVIKIO)
+      cucascade_add_kvikio()
+      target_compile_definitions(cucascade_io_thirdparty
+                                 INTERFACE CUCASCADE_USE_KVIKIO)
     endif()
 
     # Gates the cufile backend in io_config and the datasource registry. Carried
@@ -458,18 +586,38 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   # include dir, uring types, ...).
   if(CUCASCADE_BUILD_IO)
     target_link_libraries(cucascade_cudf_objects PUBLIC cucascade_io_objects)
+    # src/cudf/disk_io_context.cpp probes io_uring with liburing.
+    target_link_libraries(cucascade_cudf_objects PRIVATE PkgConfig::LIBURING)
   endif()
 endif()
 
+# Make @p target build kvikIO's engine plugins. A dependency on the io object
+# library would not do: for an object library it only orders compilation, and
+# the plugins would not be linked unless something else asked for them.
+function(cucascade_io_depends_on_engines target)
+  foreach(_engine kvikio_engine_uring kvikio_engine_cufile_reactor
+                  kvikio_engine_uring_http)
+    if(TARGET ${_engine})
+      add_dependencies(${target} ${_engine})
+    endif()
+  endforeach()
+endfunction()
+
 if(CUCASCADE_BUILD_IO)
   # Link libraries shared by the io object library and the installable io
-  # targets. PkgConfig::* imported targets are reconstructed on the consumer
-  # side by cuCascadeConfig.cmake (same names).
-  set(CUCASCADE_IO_LINK_LIBS PkgConfig::LIBURING OpenSSL::SSL OpenSSL::Crypto)
+  # targets: only kvikIO, whose engine plugins carry liburing and OpenSSL.
+  set(CUCASCADE_IO_LINK_LIBS)
+  if(CUCASCADE_USE_KVIKIO)
+    list(APPEND CUCASCADE_IO_LINK_LIBS kvikio::kvikio)
+  endif()
 
   target_link_libraries(
     cucascade_io_objects PUBLIC cucascade_objects ${CUCASCADE_IO_LINK_LIBS}
                                 cucascade_io_thirdparty)
+  # cuCascade loads the engines by name at run time, so nothing links them. The
+  # io libraries depend on the plugin targets instead (see
+  # cucascade_io_depends_on_engines below), so that a build of just the io
+  # library, or of a host that links it, builds the plugins too.
   target_include_directories(cucascade_io_objects
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_definitions(cucascade_io_objects
@@ -558,8 +706,11 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
       target_link_libraries(cucascade_cudf_static PUBLIC cudf::cudf
                                                          cucascade_static)
       if(CUCASCADE_BUILD_IO)
-        # The datasource bridge references io-core symbols.
-        target_link_libraries(cucascade_cudf_static PUBLIC cucascade_io_static)
+        # The datasource bridge references io-core symbols; the DISK tier's
+        # io_uring probe needs liburing. PkgConfig::LIBURING is reconstructed on
+        # the consumer side by cuCascadeConfig.cmake (same name).
+        target_link_libraries(cucascade_cudf_static PUBLIC cucascade_io_static
+                                                           PkgConfig::LIBURING)
       endif()
       target_compile_features(cucascade_cudf_static PUBLIC cxx_std_20)
 
@@ -585,6 +736,7 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
       set_target_properties(
         cucascade_io_static PROPERTIES OUTPUT_NAME cucascade_io
                                        EXPORT_NAME cucascade_io_static)
+      cucascade_io_depends_on_engines(cucascade_io_static)
     endif()
   endif()
 endif()
@@ -642,6 +794,7 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
       if(CUCASCADE_BUILD_IO)
         # The datasource bridge references io-core symbols.
         target_link_libraries(cucascade_cudf_shared PUBLIC cucascade_io_shared)
+        target_link_libraries(cucascade_cudf_shared PRIVATE PkgConfig::LIBURING)
       endif()
       target_compile_features(cucascade_cudf_shared PUBLIC cxx_std_20)
 
@@ -665,6 +818,7 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
 
       set_target_properties(cucascade_io_shared PROPERTIES OUTPUT_NAME
                                                            cucascade_io)
+      cucascade_io_depends_on_engines(cucascade_io_shared)
     endif()
   endif()
 endif()

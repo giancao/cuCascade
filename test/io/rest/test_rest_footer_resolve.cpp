@@ -107,7 +107,7 @@ struct footer_fixture {
 footer_fixture make_ioctx(loopback_range_server const& server, config cfg, std::size_t reactors = 1)
 {
   auto authorizer = std::make_shared<list_capable_mock_authorizer>(server.endpoint());
-  auto context    = std::make_shared<rest_reactor::reactor_context>(cfg, authorizer, nullptr);
+  auto context    = cucascade::io::rest::make_reactor_context(cfg, authorizer, nullptr);
   auto ioctx      = std::make_shared<rest_ioctx>(reactors, std::move(context));
   return {std::move(authorizer), std::move(ioctx)};
 }

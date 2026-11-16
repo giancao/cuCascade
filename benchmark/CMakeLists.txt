@@ -99,8 +99,9 @@ if(CUCASCADE_BUILD_IO)
       $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS};-Wno-null-dereference>
       ${CUCASCADE_CUDA_WARNING_FLAGS})
 
-  target_link_libraries(cucascade_parquet_benchmark
-                        PRIVATE cucascade_cudf cucascade_io CUDA::cudart_static)
+  target_link_libraries(
+    cucascade_parquet_benchmark PRIVATE cucascade_cudf cucascade_io
+                                        CUDA::cudart_static kvikio::engine_uring)
 
   # Range-read I/O benchmark: isolates raw column-chunk range reads (io_context
   # vector-io vs cudf datasource) into host/device, without parquet decode.
@@ -113,8 +114,9 @@ if(CUCASCADE_BUILD_IO)
       $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS};-Wno-null-dereference>
       ${CUCASCADE_CUDA_WARNING_FLAGS})
 
-  target_link_libraries(cucascade_parquet_io_benchmark
-                        PRIVATE cucascade_cudf cucascade_io CUDA::cudart_static)
+  target_link_libraries(
+    cucascade_parquet_io_benchmark PRIVATE cucascade_cudf cucascade_io
+                                           CUDA::cudart_static kvikio::engine_uring)
 endif()
 
 # =============================================================================
@@ -138,7 +140,7 @@ if(CUCASCADE_BUILD_S3_BENCHMARK)
   target_link_libraries(
     cucascade_s3_parquet_benchmark
     PRIVATE cucascade_cudf cucascade_io ${AWSSDK_LINK_LIBRARIES}
-            CUDA::cudart_static)
+            CUDA::cudart_static kvikio::engine_uring_http)
 
   # S3 range-read I/O benchmark: raw column-chunk range reads (rest vector-io /
   # host->device) into host/device, without parquet decode.
@@ -154,5 +156,5 @@ if(CUCASCADE_BUILD_S3_BENCHMARK)
   target_link_libraries(
     cucascade_s3_parquet_io_benchmark
     PRIVATE cucascade_cudf cucascade_io ${AWSSDK_LINK_LIBRARIES}
-            CUDA::cudart_static)
+            CUDA::cudart_static kvikio::engine_uring_http)
 endif()

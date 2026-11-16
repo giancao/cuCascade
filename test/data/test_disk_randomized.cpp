@@ -24,6 +24,7 @@
 #include "utils/cudf_test_utils.hpp"
 #include "utils/disk_test_utils.hpp"
 #include "utils/mock_test_utils.hpp"
+#include "utils/page_cache_check.hpp"
 
 #include <cucascade/cudf/builtin_converters.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -285,6 +286,9 @@ TEST_CASE("random mixed tables round-trip through every disk backend and path",
 
     // Written by the device path ...
     auto const from_gpu = registry().convert<disk_data_representation>(*gpu, &disk, stream);
+    // Before anything reads the file: no page of it is in the page cache with other bytes than
+    // the disk has, whichever io stack wrote it.
+    test::check_page_cache_matches_disk(from_gpu->get_disk_table().file_path);
     {  // ... read by the device path
       auto back = registry().convert<gpu_table_representation>(*from_gpu, &gpu_space, stream);
       test::expect_cudf_tables_equal_on_stream(expected, back->get_table_view(), stream);
@@ -298,6 +302,7 @@ TEST_CASE("random mixed tables round-trip through every disk backend and path",
     // Written by the host path ...
     auto const host     = registry().convert<host_data_representation>(*gpu, &host_space, stream);
     auto const from_cpu = registry().convert<disk_data_representation>(*host, &disk, stream);
+    test::check_page_cache_matches_disk(from_cpu->get_disk_table().file_path);
     {  // ... read by the device path
       auto back = registry().convert<gpu_table_representation>(*from_cpu, &gpu_space, stream);
       test::expect_cudf_tables_equal_on_stream(expected, back->get_table_view(), stream);

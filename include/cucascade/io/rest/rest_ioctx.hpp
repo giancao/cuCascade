@@ -18,271 +18,192 @@
 
 #pragma once
 
-#include <cucascade/exec/admission_control.hpp>
-#include <cucascade/io/rest/object_store_lister.hpp>
-#include <cucascade/io/rest/rest_reactor.hpp>
-#include <cucascade/io/rest/s3/list_parser.hpp>
-#include <cucascade/io/templated_ioctx.hpp>
+/**
+ * @file rest_ioctx.hpp
+ * @brief The @c ioctx served by kvikIO's `uring_http` engine.
+ */
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
+#include <cucascade/io/config.hpp>
+#include <cucascade/io/engine_ioctx.hpp>
+#include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/object_store_config.hpp>
+#include <cucascade/io/rest/config.hpp>
+#include <cucascade/io/rest/forward.hpp>
+#include <cucascade/io/rest/rest_reactor.hpp>
+
+#include <kvikio/io/nic_topology.hpp>
+#include <kvikio/io/object_listing.hpp>
+#include <kvikio/io/rest/uring_http_api.hpp>
+#include <kvikio/io/rest/uring_http_engine.hpp>
+
 #include <cstddef>
-#include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace cucascade::io::rest {
 
-// ---------------------------------------------------------------------------
-// rest_ioctx
-// ---------------------------------------------------------------------------
+/**
+ * @brief What the host knows about the interface the REST engine sends through.
+ *
+ * Discovers @p interface (empty: the default route's) from sysfs and describes
+ * it for kvikIO, which does no discovery of its own.  No value when nothing
+ * could be discovered; the engine then uses its default pool size and pins
+ * nothing.
+ */
+[[nodiscard]] std::optional<kvikio::io::nic_topology> discover_egress_nic(
+  std::string_view interface) noexcept;
 
 /**
- * @brief RESTful object-store (s3://) ioctx. Specialisation of
- *        @c templated_ioctx<rest_reactor>.
+ * @brief An @c engine_ioctx over an object-store engine (s3://).
  *
- * Owns a pool of @c rest_reactor workers (load-balanced by the base) that share
- * one @p authorizer.  Overrides @c create_io_object to resolve an object's size
- * via a blocking HEAD before constructing the @c rest_io_object — the static
- * reactor factory cannot do this since it needs the authorizer + a round-trip.
+ * Normally the `uring_http` engine: HTTP/1.1 on io_uring. The data path and the
+ * opens go through the engine interface; LIST, batched footer resolution and the
+ * transport counters are the engine's own and are forwarded here under the
+ * names they always had.
  *
- * Control-plane calls (the HEAD or footer probe of an open, LIST pages, a
- * @ref resolve_footer_objects batch) block the caller and run on one reactor
- * picked per call: the least backlogged (@c rest_reactor::queued_bytes), ties
- * rotated across calls, so any reactor of a multi-reactor pool may serve one.
- * The exchanges use that reactor's connections while its worker accepts work.
- * Before the pool is started (@c start), after it stopped, or when the call is
- * made from a reactor thread (e.g. a completion callback, which must not wait on
- * a reactor loop that may be its own), they run instead on a short-lived
- * private helper thread with its own io_uring ring and new connections — far
- * heavier, so start the pool before issuing control-plane calls.  io_uring
- * never runs on the caller's thread.
+ * It can also be served by kvikIO's built-in `curl` engine, the fallback when
+ * `uring_http` cannot be used. That engine reads and lists but has no batched
+ * footer resolution and no transport counters: @ref resolve_footer_objects
+ * throws, and the counters read as zero. @ref has_transport_api tells which.
+ *
+ * Build one with @ref make_rest_ioctx or @ref make_curl_rest_ioctx.
  */
-class rest_ioctx : public templated_ioctx<rest_reactor> {
+class rest_ioctx : public engine_ioctx {
  public:
-  /// Build a pool of @p n_reactors reactors, all sharing @p ctx (one context per
-  /// pool: it carries the per-reactor @c config, the presigning authorizer, and
-  /// the pinned bounce-staging resource — all of which must outlive this ioctx).
-  /// The ioctx config is sourced from the reactors themselves — see
-  /// @c templated_ioctx.
-  ///
-  /// @p n_reactors is a total; 0 sizes the pool from the egress NIC (one reactor per IRQ CPU,
-  /// pinned to it, when the NIC's queue IRQs are steered to a strict subset of its NUMA node's
-  /// cores; the default 2 otherwise).  A pinned reactor's priority is raised only with
-  /// @c config::raise_reactor_priority (off by default).
-  /// @throws std::invalid_argument when the config is invalid (@c config::validate) or
-  /// @c rest.fan_out exceeds a positive @p n_reactors (the default fan-out of 2 is clamped to a
-  /// one-reactor pool instead, as the former hard-coded fan-out was).
-  rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
+  /// Serve @p engine, which must list objects (the `uring_http` or `curl` engine).
+  /// @throws std::invalid_argument when it does not.
+  explicit rest_ioctx(std::shared_ptr<kvikio::io::engine> engine);
 
-  /// Counters of the whole pool: the reactors' @c transport_stats summed (extremes for the MSS
-  /// and in-flight peaks).  A snapshot; safe while the pool runs.
-  [[nodiscard]] transport_stats stats() const noexcept;
+  /// Build a pool of @p n_reactors reactors (0 = sized from the egress NIC),
+  /// all sharing @p ctx, whose staging source the caller keeps alive.  Creates
+  /// the `uring_http` engine directly, which needs the engine plugin at link
+  /// time (`kvikio::engine_uring_http`); tests and benchmarks do that.
+  rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
+    : rest_ioctx(make_engine(n_reactors, std::move(ctx)))
+  {
+  }
 
-  [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
+  /// Whether the engine is `uring_http`, with its transport counters, fan-out
+  /// and batched footer resolution; false when the `curl` engine serves this.
+  [[nodiscard]] bool has_transport_api() const noexcept { return _api != nullptr; }
 
-  /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
-  /// per page (a page holds at most 1000 entries, so peak memory is one page
-  /// regardless of bucket population).  @p sink returns false to stop early —
-  /// no further LIST requests are issued.  @p page_size is clamped to [1,1000]
-  /// (0 and >1000 mean 1000).  Throws (never truncates) on a truncated page
-  /// without a continuation token, and once more than @p max_scanned entries
-  /// have been scanned across pages (bounds time / request count on a prefix
-  /// whose population dwarfs the caller's matches).
+  /// Counters of the whole pool.  A snapshot; safe while the pool runs.  All
+  /// zero without the transport interface.
+  [[nodiscard]] transport_stats stats() const noexcept
+  {
+    return _api != nullptr ? _api->stats() : transport_stats{};
+  }
+
+  /// How many reactors one read is spread over: the configured fan-out, clamped
+  /// to the size of the pool.  1 without the transport interface.
+  [[nodiscard]] std::size_t dispatch_fanout() const noexcept
+  {
+    return _api != nullptr ? _api->fan_out() : std::size_t{1};
+  }
+
+  /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink.
   void list_objects_paged(std::string_view bucket,
                           std::string_view prefix,
                           std::size_t page_size,
                           std::function<bool(s3::list_objects_v2_page const&)> const& sink,
-                          std::optional<std::size_t> max_scanned = std::nullopt);
+                          std::optional<std::size_t> max_scanned = std::nullopt)
+  {
+    _listing->list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
+  }
 
-  /// Whole-listing convenience over @c list_objects_paged: every object under
-  /// @p prefix, in document order, with sizes.  Throws (never truncates) when
-  /// the accumulated entries would exceed @p max_keys — a partial key set would
-  /// resolve a glob to a silently incomplete table.
+  /// The entries of a bucket under @p prefix.
   [[nodiscard]] std::vector<s3::list_entry> list_objects(
     std::string_view bucket,
     std::string_view prefix,
     std::size_t page_size               = 1000,
-    std::optional<std::size_t> max_keys = std::nullopt);
+    std::optional<std::size_t> max_keys = std::nullopt)
+  {
+    return _listing->list_objects(bucket, prefix, page_size, max_keys);
+  }
 
-  /// The configured matched cap (@c config.list_max_matches) — exposed so a
-  /// glob layer one level up can bound its match set without a reactor handle.
-  /// Falls back to the built-in default when the pool is empty (never in
-  /// practice).
-  [[nodiscard]] std::size_t list_max_matches() const;
+  /// The configured cap on the matches of one listing.
+  [[nodiscard]] std::size_t list_max_matches() const { return _listing->list_max_matches(); }
 
-  /// Resolve many objects' footers concurrently.  Per-entry semantics are
-  /// IDENTICAL to @c open_io_object(path, parquet_footer_probe): one verified
-  /// suffix GET; 200/416/unverifiable-206 fall back to a HEAD supplying
-  /// size+tag; the same retry policy per entry, never stalling siblings.  The
-  /// whole batch runs on one reactor, picked like every control-plane call: the
-  /// least-backlogged reactor of the pool, ties rotated across calls (not
-  /// necessarily reactor 0).  Its exchanges use that reactor's connections
-  /// while its worker accepts work; before the pool is started, after it
-  /// stopped, or when called from a reactor thread, they run on a short-lived
-  /// private helper thread with its own io_uring ring and connections (see the
-  /// class notes).  @p on_result is invoked ON THE CALLER'S THREAD, SERIALLY,
-  /// as each entry lands — completion order, no all-entries barrier.
-  ///
-  /// Every input occurrence is delivered exactly once (duplicates delivered
-  /// per occurrence, disambiguated by index); no callback runs after the
-  /// call returns.  On @p stop, in-flight transfers abort and every
-  /// undelivered entry receives one std::system_error(operation_canceled) —
-  /// including a batch cancelled while queued behind another batch (one
-  /// active batch per ioctx; concurrent calls FIFO-serialize).  If
-  /// @p on_result throws, the remaining entries are cancelled (delivered as
-  /// canceled, their callback throws suppressed) and the first exception is
-  /// rethrown after the sweep.  Throws directly only on submission errors:
-  /// an empty batch, the API disabled via
-  /// @c config::footer_resolve_max_inflight == 0, or an explicit
-  /// @c footer_resolve_stash_budget smaller than @c footer_probe_bytes.  An
-  /// unparsable or non-s3 path is a per-entry error, not a batch error.
-  /// Should the transfer driver itself fail (its helper thread cannot be
-  /// started, or it fails mid-batch), every undelivered entry is delivered as
-  /// canceled before that failure is rethrown — exactly-once holds on every
-  /// exit path.  This ioctx must outlive the call.
+  /// Resolve the size and footer bytes of a batch of objects.
+  /// @throws not_implemented_error without the transport interface.
   void resolve_footer_objects(std::span<std::string const> paths,
                               std::function<void(footer_resolve_result)> const& on_result,
-                              std::stop_token stop = {});
+                              std::stop_token stop = {})
+  {
+    if (_api == nullptr) { throw not_implemented_error("rest: resolve_footer_objects"); }
+    _api->resolve_footer_objects(paths, on_result, std::move(stop));
+  }
 
-  /// Live / high-water bytes reserved from the footer-resolve stash budget.
-  /// Both are 0 when the batched footer API is disabled or has never run on
-  /// this ioctx.  Safe to call while the pool is running.
-  [[nodiscard]] std::size_t footer_stash_reserved_bytes() const noexcept;
-  [[nodiscard]] std::size_t footer_stash_reserved_peak_bytes() const noexcept;
+  [[nodiscard]] std::size_t footer_stash_reserved_bytes() const noexcept
+  {
+    return _api != nullptr ? _api->footer_stash_reserved_bytes() : std::size_t{0};
+  }
 
-  /// Open every reactor's connection pool against @p bucket_url's bucket, so the
-  /// query's first reads find pooled connections instead of paying TCP+TLS on
-  /// the hot path.  Fans the work out to the reactors and returns immediately:
-  /// each reactor's connection cache is thread-confined, so only its own worker
-  /// can fill it.
-  ///
-  /// Rate-limited rather than run once, because what goes stale is the
-  /// connection, not the bucket.  @c conn_max_age is a hard cap on reusing a
-  /// pooled connection (its idle cutoff), so a pool warmed before an idle
-  /// gap longer than that is cold again by the next query -- a warm-once flag
-  /// would serve the first query and no other.  Re-warms when the endpoint
-  /// changes or the last warm-up is at least @c conn_max_age old, which is free
-  /// for back-to-back queries and self-correcting for spaced-out ones.
-  void warmup(std::string_view bucket_url) noexcept override;
-
-  // -- Writes: not yet implemented ------------------------------------------
-  //
-  // REST writes (S3 PUT / multipart upload) are not implemented yet.  Every
-  // write and flush hook reports @c not_implemented_error
-  // (@c std::errc::not_supported) without touching the network: the
-  // synchronous ones throw, the asynchronous ones return a failed future, and
-  // @c supports_write() / @c supports_device_write() stay false.
-
-  std::size_t host_write_io(io_object const& obj,
-                            std::size_t offset,
-                            std::size_t size,
-                            std::uint8_t const* src) override;
-
-  exec::semi_future<std::size_t> mixed_writev_async_io(
-    io_object const& obj, std::vector<prepared_io_slice>&& slices) noexcept override;
-
-  void flush_io(io_object const& obj) override;
-
-  exec::semi_future<void> flush_async_io(io_object const& obj,
-                                         io_priority priority) noexcept override;
-
- protected:
-  /// This pool's placement (plan and NIC), computed at construction and shared with its
-  /// reactors; never stored on the reactor_context, which several pools may share.
-  std::shared_ptr<detail::pool_placement const> _placement;
-
-  /// Always throws @c not_implemented_error: no object is created, no HEAD is
-  /// sent.
-  std::shared_ptr<io_object> create_io_object_for_write(std::string path,
-                                                        write_open_options options) override;
-
-  /// Backend hook invoked by @c ioctx::open_io_object: parse @p path
-  /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
-  /// Throws on a non-s3 scheme or a failed HEAD.
-  std::shared_ptr<io_object> create_io_object(std::string path) override;
-
-  /// Hinted open: @c open_hint::parquet_footer_probe resolves the size AND stashes
-  /// the object's trailing bytes in one suffix-range GET, stashed on the
-  /// returned io_object; every other hint falls back to the plain HEAD path above.
-  std::shared_ptr<io_object> create_io_object(std::string path, open_hint hint) override;
-
-  /// Known-size open: the caller already learned the object's size (e.g. from a
-  /// ListObjectsV2 response), so the io_object is built with ZERO network — no
-  /// HEAD, no probe.
-  std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size) override;
+  [[nodiscard]] std::size_t footer_stash_reserved_peak_bytes() const noexcept
+  {
+    return _api != nullptr ? _api->footer_stash_reserved_peak_bytes() : std::size_t{0};
+  }
 
  private:
-  rest_ioctx(std::shared_ptr<detail::pool_placement const> placement,
-             std::shared_ptr<rest_reactor::reactor_context> ctx);
+  [[nodiscard]] static std::shared_ptr<kvikio::io::engine> make_engine(
+    std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx)
+  {
+    // The pool is planned for the interface the config names, as before.
+    auto nic = ctx != nullptr ? discover_egress_nic(ctx->cfg().interface) : std::nullopt;
+    return std::make_shared<kvikio::io::rest::uring_http_engine>(
+      n_reactors, std::move(ctx), std::move(nic));
+  }
 
-  /// Resolve @p path with a single suffix-range GET: it discovers the size and
-  /// stashes the object's trailing bytes on the returned io_object so cuDF's
-  /// footer reads are served locally.  Falls back to a plain HEAD (no stash)
-  /// when the response is unusable.
-  std::shared_ptr<io_object> create_footer_probe_object(std::string path);
-
-  object_store_lister _lister;
-  std::atomic<std::size_t> _control_next{0};
-
-  /// The effective resolve_footer_objects concurrency cap: the configured knob, or one
-  /// reactor's max_connections under footer_resolve_auto (a batch runs on one reactor).  0 =
-  /// the API is disabled.
-  [[nodiscard]] std::size_t footer_resolve_inflight_cap() const;
-
-  /// The reactor a control-plane call (HEAD, footer probe, LIST, footer batch) runs on: the
-  /// least backlogged, ties rotated, so control traffic does not pile onto reactor 0.  The call
-  /// itself then runs on that reactor's worker, or on a private helper when the worker does not
-  /// accept work or the caller is a reactor thread.
-  [[nodiscard]] rest_reactor& control_reactor();
-
-  // Batched-footer-resolve coordination: one active batch per ioctx, later
-  // calls FIFO-parked on the ticket queue (stop-aware — a queued batch whose
-  // token fires is removed without ever becoming active).  _footer_budget is
-  // created in the constructor and never reassigned, so the stash gauges may
-  // read it without the mutex.
-  mutable std::mutex _footer_resolve_mutex;
-  std::condition_variable_any _footer_resolve_cv;
-  std::deque<std::uint64_t> _footer_resolve_queue;
-  std::uint64_t _footer_resolve_next_ticket{0};
-  bool _footer_resolve_active{false};
-  std::shared_ptr<exec::admission_control> _footer_budget;
-
-  /// Warn once per path when @p obj has no strong ETag (none, weak or malformed).
-  /// Such an object cannot be revalidated across opens, so its bytes and
-  /// metadata are cached only within this open.  Returns @p obj unchanged.
-  std::shared_ptr<io_object> warn_if_no_strong_etag(std::shared_ptr<io_object> obj);
-
-  /// Guards the warm-up rate limiter.  Contended once per query at most, and
-  /// never on a read path.
-  std::mutex _warm_mtx;
-  std::mutex _weak_etag_mtx;
-  std::vector<std::string> _weak_etag_paths;  ///< paths already warned about, bounded
-  /// Bucket the pools were last warmed against, and when.  An unset time means
-  /// "never warmed", which no elapsed comparison can express.
-  std::string _warmed_bucket;
-  std::optional<std::chrono::steady_clock::time_point> _warmed_at;
+  kvikio::io::object_listing* _listing;
+  kvikio::io::rest::uring_http_api* _api;
 };
+
+/**
+ * @brief Select kvikIO's `uring_http` engine for s3:// paths and serve it.
+ *
+ * The engine is selected in kvikIO's process-wide registry, which loads its
+ * plugin, signs for @p object_store, stages device reads through @p staging
+ * (may be null: staged device reads then fail) and is already started.
+ *
+ * @throws kvikio::io::engine_selection_error when the engine cannot be
+ *         selected: its plugin is missing, io_uring is unusable, or the
+ *         configuration is rejected.
+ */
+[[nodiscard]] std::shared_ptr<rest_ioctx> make_rest_ioctx(
+  std::size_t n_reactors,
+  config cfg,
+  object_store_config const& object_store,
+  std::shared_ptr<kvikio::io::staging_source> staging);
+
+/**
+ * @brief Select kvikIO's built-in `curl` engine for s3:// paths and serve it.
+ *
+ * The fallback for when `uring_http` cannot be used.  It signs for
+ * @p object_store (endpoint, region and credentials override the `AWS_*`
+ * environment variables) and stages device reads through @p staging.
+ *
+ * @throws kvikio::io::engine_selection_error when kvikIO was built without
+ *         remote support.
+ */
+[[nodiscard]] std::shared_ptr<rest_ioctx> make_curl_rest_ioctx(
+  object_store_config const& object_store, std::shared_ptr<kvikio::io::staging_source> staging);
 
 /**
  * @brief The CPUs a REST pool built now from the calling thread would pin its reactors to.
  *
- * Runs the planning a @ref rest_ioctx constructor runs (the egress NIC from
+ * Runs the planning the engine runs when it starts (the egress NIC from
  * @c cfg.interface, its queue-IRQ steering, @c cfg.pin_to_irq_cpus, @p n_reactors with 0 =
  * sized from the NIC) without starting anything.  Sorted and unique; empty when the pool would
  * run unpinned.  An embedder that sizes its own thread pools before the REST pool exists uses
- * it to keep them off these CPUs, which then carry only the NIC's interrupts and the reactors.
- * Call it from a thread with the affinity the pool will be built from: pins are restricted to
- * it, exactly as for the pool.
+ * it to keep them off these CPUs.  Call it from a thread with the affinity the pool will be
+ * built from.  Does not load the engine plugin.
  */
 [[nodiscard]] std::vector<int> planned_reactor_cpus(std::size_t n_reactors, config const& cfg);
 

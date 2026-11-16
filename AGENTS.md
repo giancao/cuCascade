@@ -8,7 +8,7 @@ cache). Each library is built as `<name>_shared` and `<name>_static`, with stric
 | Library | Sources | Depends on |
 | --- | --- | --- |
 | `cucascade_cudf` (`CUCASCADE_BUILD_CUDF`) | `src/cudf`, `include/cucascade/cudf` | io, core, libcudf |
-| `cucascade_io` (`CUCASCADE_BUILD_IO`) | `src/{io,exec}`, `include/cucascade/{io,exec}` | core, liburing, OpenSSL |
+| `cucascade_io` (`CUCASCADE_BUILD_IO`) | `src/io`, `include/cucascade/{io,exec}` | core, kvikIO (`CUCASCADE_USE_KVIKIO`) and its engine plugins (liburing, OpenSSL) |
 | `cucascade` (core) | `src/{memory,data,cuda}`, `include/cucascade/{memory,data,cuda,utils,log}`, `include/cucascade/*.hpp` | topology, RMM, CUDA runtime |
 | `cucascade_topology_discovery` | `src/memory/topology_discovery.cpp`, `src/log` | NVML; never a link-time `libcuda` dependency |
 
@@ -40,6 +40,53 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   configured it, and the `build`/`test` tasks always use `build/release`, so give other envs their
   own dir: `pixi run -e cuda-13-stable bash -c "cmake --preset release -B build/cuda-13-stable &&
   cmake --build build/cuda-13-stable"`.
+- kvikIO is the `kvikio` git submodule (`git submodule update --init kvikio`), built from source
+  as `libkvikio.so` when `CUCASCADE_USE_KVIKIO` is ON (the default). Configure fails unless it is
+  the same RAPIDS release as libcudf. The submodule is on 26.10, so use a `*-stable` env. The io
+  library requires kvikIO (`CUCASCADE_BUILD_IO=ON` with `CUCASCADE_USE_KVIKIO=OFF` fails at
+  configure), so the nightly envs, `default` included, can only build with
+  `-DCUCASCADE_BUILD_IO=OFF -DCUCASCADE_USE_KVIKIO=OFF`. To build another checkout, set
+  `CUCASCADE_KVIKIO_SOURCE_DIR`; set it to an empty string to link an installed kvikIO, which
+  must be the POC fork (upstream kvikIO lacks the `kvikio/exec` and `kvikio/io` headers).
+- The io engines live in the kvikIO submodule and are re-exported here under their cuCascade
+  names: `cucascade::exec::{semi_future,promise,future,try_t,invocable,admission_control}`,
+  `exec::thread_util`, the request and error types, `byte_range`, `object_identity`, `io_utils`,
+  `tiered_queue`, `slot_pool`, the URI parser, `object_store_config`, and everything under
+  `io/uring/`, `io/cufile/` (except the per-path GDS probe), `io/rest/` and `io/tls/`.
+  `templated_ioctx` is glue over kvikIO's `reactor_dispatch`. Change these in the kvikIO
+  submodule (`kvikio/cpp/{include/kvikio,src}/{exec,io}`), commit there first, then bump the
+  submodule here. `CUCASCADE_USE_ABSEIL_INVOCABLE` and the moodycamel namespace are passed on to
+  the kvikIO build and must agree with it.
+- What is left of the io layer here: `ioctx` with the `fs_cache` and metadata store,
+  `engine_ioctx` (the facade over a kvikIO engine) and its thin subclasses `uring_ioctx`,
+  `cufile_ioctx`, `rest_ioctx`, the staging source over a HOST memory resource, NIC and storage
+  discovery, the datasource registry, and s3rdma.
+- A host chooses a backend only through `io_config::backend` (`io_backend`, with
+  `string_to_enum` / `enum_to_string` for its config spelling) and asks the registry which
+  context serves local files (`io_context_registry::local_type()`). What an engine offers beyond
+  the engine interface (bucket listing, the `uring` gauges) is reached with
+  `engine_api<Api>(ctx)` (`engine_ioctx.hpp`), by interface; hosts should not cast an `ioctx` to
+  `uring_ioctx` or `rest_ioctx`.
+- Each engine is a kvikIO plugin built next to `libkvikio.so`: `libkvikio_engine_uring.so`,
+  `libkvikio_engine_cufile_reactor.so`, `libkvikio_engine_uring_http.so`. The cuCascade libraries
+  do not link them; the factories select an engine by name in kvikIO's registry
+  (`make_uring_ioctx_factory` falls back to the built-in `cufile_posix` engine only when the plugin cannot be loaded or io_uring is not allowed in the process; `make_rest_ioctx_factory` falls back to `curl` only when the plugin cannot be loaded. An engine that exists but cannot be created yields no context).
+  Tests and benchmarks that use reactor, transport or TLS classes directly, or build an ioctx
+  from a reactor context, link the plugin target (`kvikio::engine_uring`,
+  `kvikio::engine_cufile_reactor`, `kvikio::engine_uring_http`); `make_reactor_context` wraps a
+  HOST memory resource for them.
+- `cucascade::io::{rest,tls,http,net}` are namespaces with a using-directive for kvikIO's
+  (`io/rest/forward.hpp`), so qualified names resolve to kvikIO's declarations. Do not declare a
+  nested namespace there whose name kvikIO also uses (`detail`, `s3`): it would hide kvikIO's.
+  The io test binary force-includes `forward.hpp` because the tests of the REST layers include
+  kvikIO's private headers (`"io/rest/..."`, `"io/tls/..."`, found through the plugin target).
+- Engines stage only through the injected staging source (the HOST space), except the cuFile
+  reactors: each owns a fixed 16 MiB page-locked scratch. That is a fixed overhead outside the HOST
+  budget, reported by `io_config::fixed_pinned_overhead_bytes()` for hosts that account for it.
+- A staging source reports exhaustion in its own type: `host_staging_source` makes it an
+  `rmm::out_of_memory`, which hosts retry on.
+- Running a kvikIO gtest from a standalone kvikIO build needs
+  `LD_PRELOAD=<build>/libkvikio.so`, or the conda copy of kvikIO is loaded instead.
 
 ## Before you finish
 
@@ -80,6 +127,14 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   types out of it, use the `cucascade::io::concurrent_queue` aliases instead of `moodycamel::`,
   and use only the parts of `exec::invocable` that `absl::AnyInvocable` also supports
   (`CUCASCADE_USE_ABSEIL_INVOCABLE`).
+- libcudf loads `libkvikio.so` too, and a process maps one library per soname, so the kvikIO built
+  here also serves libcudf; the environment's own copy must not be the one loaded. cuCascade puts
+  its build directory first in the runtime search path of its binaries and makes `libkvikio.so` a
+  direct dependency of everything linking the io library; the `[kvikio]` test fails if another
+  copy is loaded. A host linking cuCascade statically inherits the direct dependency but has to
+  order the search path of its own binaries itself, with `CUCASCADE_KVIKIO_LIBRARY_DIR`. It also
+  has to add cuCascade before any package whose CMake config imports kvikIO (libcuvs does), or
+  configure fails; later `find_package(kvikio)` calls are served by this build.
 
 ## Invariants that are easy to break
 
@@ -101,6 +156,21 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   twice throws.
 - `disk_data_representation` deletes its file on destruction, and its `clone()` always throws;
   materialize to another tier through a converter.
+- A backend that writes with O_DIRECT (`write_alignment_requirement() > 1`, i.e. uring or the cuFile
+  reactor with `use_odirect`) is handed whole blocks only, and `ioctx`'s write entry points judge
+  a request as a whole (rules in the comment in `io_context.hpp`): every block it touches must be
+  written from its first byte on, without holes, so a request starts on a block boundary; slices
+  need not be aligned, a block that takes bytes from several slices is assembled in host memory
+  and written in the same request; a request may stop inside a block only where the file has no
+  data, and the rest of that block is zeros, so files end on a block boundary. Anything else is
+  `std::invalid_argument` before anything is written. Nothing is read back, nothing is kept
+  between requests, no lock. Without O_DIRECT writes reach the backend unchanged.
+- The DISK converters hand the io context whole blocks only (`disk_block_size()`, 4 KiB): buffers
+  start on block boundaries and the partial last block of each is padded with zeros in host
+  memory (`disk_edge_blocks`). Do not write a partial block: an io stack using O_DIRECT would
+  write it through the page cache next to blocks it writes directly, and mixing the two on one
+  file can leave stale zero pages in the page cache that a later buffered read returns (seen on
+  XFS, kernel 6.11). `[disk][io][layout]` checks the slices.
 - A repository's ordering mode (`ORDERED` / `UNORDERED`) is set by its first insertion, applies to
   all partitions and is never reset; mixing `add_data_batch` and `add_data_batch_at_position`
   throws. New methods follow the public-locks / protected `*_unlocked` hook pattern. Pops and
@@ -123,6 +193,10 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   (`test/utils/child_test_runner.hpp`).
 - Tests must fail rather than hang: bound every wait with a timeout and release latches on all
   exit paths, including exceptions.
+- A test that writes a file through an io context ends with
+  `test::check_page_cache_matches_disk(path)` (`test/utils/page_cache_check.hpp`): every block is
+  read through the page cache and with O_DIRECT, and the two must agree. The write tests of the
+  uring and cuFile contexts and the randomized DISK round trip (all four backends) do.
 
 ## Conventions not enforced by tooling
 

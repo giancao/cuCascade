@@ -176,8 +176,7 @@ TEST_CASE("mixed dispatch with no reactors fails and releases prepared cache sli
   std::atomic<bool> callback_success{true};
 
   auto completion = std::make_shared<cucascade::io::prepared_io_completion>(
-    [&callback_success](std::span<cucascade::io::cache::cached_chunk* const>,
-                        bool success) noexcept {
+    [&callback_success](std::span<cucascade::io::fragment_handle const>, bool success) noexcept {
       callback_success.store(success, std::memory_order_release);
     });
 
@@ -206,15 +205,15 @@ TEST_CASE("mixed dispatch reports failure for a dropped fragmented slice past EO
   std::atomic<bool> callback_success{true};
   std::atomic<int> callback_count{0};
   auto completion = std::make_shared<cucascade::io::prepared_io_completion>(
-    [&](std::span<cucascade::io::cache::cached_chunk* const>, bool success) noexcept {
+    [&](std::span<cucascade::io::fragment_handle const>, bool success) noexcept {
       callback_success.store(success, std::memory_order_release);
       callback_count.fetch_add(1, std::memory_order_acq_rel);
     });
 
   cucascade::io::cache::cached_chunk chunk{object->size()};
-  cucascade::io::prepared_io_slice slice{
-    cucascade::io::range{object->size(), 64},
-    cucascade::io::host_buffer{std::vector<cucascade::io::cache::cached_chunk*>{&chunk}}};
+  cucascade::io::prepared_io_slice slice{cucascade::io::range{object->size(), 64},
+                                         cucascade::io::cache::make_fragment_buffer(
+                                           &chunk, cucascade::io::cache::chunk_fill::whole(), 64)};
   slice.on_complete = completion;
   std::vector<cucascade::io::prepared_io_slice> slices;
   slices.push_back(std::move(slice));
@@ -259,9 +258,8 @@ struct reactor_pool {
     }
     if (device_slice) {
       // An explicit device id keeps dispatch from querying the current CUDA device.
-      slices.emplace_back(
-        cucascade::io::range{n_slices * 100, 40},
-        cucascade::io::device_buffer{&byte, ::cuda::stream_ref{cudaStream_t{nullptr}}, 0});
+      slices.emplace_back(cucascade::io::range{n_slices * 100, 40},
+                          cucascade::io::device_buffer{&byte, cudaStream_t{nullptr}, 0});
       slices.back().priority = priority;
     }
     return context->mixed_readv_async_io(*object, std::move(slices));
@@ -646,7 +644,7 @@ TEST_CASE("write_split_bytes cuts large write slices at aligned boundaries",
   for (auto& reactor : context->_reactors) {
     for (auto& request : reactor->requests) {
       for (auto const& slice : request->slices) {
-        pieces.push_back(slice);
+        pieces.push_back(slice.clone());
       }
     }
   }
@@ -734,26 +732,33 @@ TEST_CASE("validate_write_slices enforces the write slice invariants",
   using cucascade::io::validate_write_slices;
 
   std::array<std::uint8_t, 64> host{};
-  auto* device      = reinterpret_cast<std::uint8_t const*>(std::uintptr_t{0x10000});
-  auto const stream = ::cuda::stream_ref{cudaStream_t{nullptr}};
+  auto* device              = reinterpret_cast<std::uint8_t const*>(std::uintptr_t{0x10000});
+  cudaStream_t const stream = nullptr;
 
-  std::vector<prepared_io_slice> good{make_host_write_slice(range{100, 10}, host.data()),
-                                      make_device_write_slice(range{0, 100}, device, stream)};
+  // prepared_io_slice is move-only, so a list of them is built by moving.
+  auto slices_of = [](auto&&... items) {
+    std::vector<prepared_io_slice> result;
+    (result.push_back(std::move(items)), ...);
+    return result;
+  };
+
+  auto const good = slices_of(make_host_write_slice(range{100, 10}, host.data()),
+                              make_device_write_slice(range{0, 100}, device, stream));
   CHECK(validate_write_slices(good) == 110);
 
   auto rejects = [](std::vector<prepared_io_slice> const& slices) {
     CHECK_THROWS_AS(validate_write_slices(slices), std::invalid_argument);
   };
-  rejects({make_host_write_slice(range{0, 10}, host.data()),
-           make_host_write_slice(range{9, 10}, host.data())});
-  rejects({make_host_write_slice(range{0, 0}, host.data())});
-  rejects({prepared_io_slice{range{0, 10}, cucascade::io::host_buffer{host.data()}}});
-  rejects({cucascade::io::make_flush_slice()});
+  rejects(slices_of(make_host_write_slice(range{0, 10}, host.data()),
+                    make_host_write_slice(range{9, 10}, host.data())));
+  rejects(slices_of(make_host_write_slice(range{0, 0}, host.data())));
+  rejects(slices_of(prepared_io_slice{range{0, 10}, cucascade::io::host_buffer{host.data()}}));
+  rejects(slices_of(cucascade::io::make_flush_slice()));
   auto both     = make_host_write_slice(range{0, 10}, host.data());
   both.d_buffer = cucascade::io::device_buffer{host.data(), stream};
-  rejects({both});
-  rejects(
-    {make_host_write_slice(range{std::numeric_limits<std::size_t>::max() - 4, 10}, host.data())});
+  rejects(slices_of(std::move(both)));
+  rejects(slices_of(
+    make_host_write_slice(range{std::numeric_limits<std::size_t>::max() - 4, 10}, host.data())));
 }
 
 TEST_CASE("io_op_request raises the object size for writes only", "[io][templated_ioctx][write]")

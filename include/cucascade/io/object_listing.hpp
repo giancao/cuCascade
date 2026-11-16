@@ -16,16 +16,26 @@
  * limitations under the License.
  */
 
-/// @file codec.hpp
-/// @brief Umbrella header for the HTTP/1.1 codec (no I/O).
-
 #pragma once
 
-#include "io/rest/http/chunked_decoder.hpp"
-#include "io/rest/http/classify.hpp"
-#include "io/rest/http/content_range.hpp"
-#include "io/rest/http/fields.hpp"
-#include "io/rest/http/iovec_sink.hpp"
-#include "io/rest/http/message.hpp"
-#include "io/rest/http/request_head.hpp"
-#include "io/rest/http/response_parser.hpp"
+/**
+ * @file object_listing.hpp
+ * @brief Listing the objects of a bucket.
+ *
+ * The interface lives in kvikIO (`kvikio/io/object_listing.hpp`) and is
+ * implemented by the engines that can list (`uring_http`, `curl`); this header
+ * re-exports it in `cucascade::io`. Reach the one of a context with
+ * `engine_api<object_listing>(ctx)` (`cucascade/io/engine_ioctx.hpp`). The
+ * page and entry types are `cucascade::io::rest::s3::list_objects_v2_page` and
+ * `list_entry`.
+ */
+
+#include <cucascade/io/rest/forward.hpp>
+
+#include <kvikio/io/object_listing.hpp>
+
+namespace cucascade::io {
+
+using kvikio::io::object_listing;
+
+}  // namespace cucascade::io

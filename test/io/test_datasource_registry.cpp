@@ -15,20 +15,35 @@
  * limitations under the License.
  */
 
+#include "io/rest/loopback_range_server.hpp"
+#include "io/rest/rest_contract_test_utils.hpp"
+#include "log/log_test_utils.hpp"
+
 #include <cucascade/io/config.hpp>
+#include <cucascade/io/rest/rest_ioctx.hpp>
 #ifdef CUCASCADE_HAS_CUFILE
 #include <cucascade/io/cufile/cufile_reactor.hpp>
 #endif
 #include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/engine_ioctx.hpp>
+#include <cucascade/io/object_listing.hpp>
+#include <cucascade/io/uring/uring_ioctx.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
+
+#include <kvikio/io/engine_registry.hpp>
 
 #include <catch2/catch_all.hpp>
 
+#include <array>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -186,6 +201,228 @@ namespace {
 }
 
 }  // namespace
+
+TEST_CASE("cufile_posix routing takes local regular files only", "[io][registry][cufile_posix]")
+{
+  registry_fixture fixture{config_for(io_backend::cufile_posix)};
+  // Repeated lookups never depend on the registry's iteration order.
+  for (int i = 0; i < 8; ++i) {
+    CHECK(fixture.registry.lookup_path("/proc/self/exe") == io_context_type::cufile_posix);
+  }
+  CHECK(fixture.registry.lookup_path("s3://bucket/key") == io_context_type::restful);
+  CHECK_FALSE(fixture.registry.lookup_path("/tmp").has_value());
+}
+
+TEST_CASE("the cufile_posix context is served by kvikIO's built-in engine",
+          "[io][registry][cufile_posix]")
+{
+  registry_fixture fixture{config_for(io_backend::cufile_posix)};
+  auto context = fixture.registry.make_ioctx(io_context_type::cufile_posix);
+  REQUIRE(context != nullptr);
+  CHECK(context->type() == io_context_type::cufile_posix);
+
+  auto* front = dynamic_cast<cucascade::io::engine_ioctx*>(context.get());
+  REQUIRE(front != nullptr);
+  CHECK(front->engine().name() == "cufile_posix");
+  // The engine cuCascade uses is the one selected in kvikIO for local files.
+  CHECK(kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local) ==
+        "cufile_posix");
+
+  // It can feed the prefetching cache, and says it has no request priorities.
+  CHECK(context->can_use_fs_cache());
+  CHECK(context->supports_write());
+  CHECK_FALSE(front->engine().capabilities().priority);
+
+  // A read through the front end returns the file's bytes.
+  auto object = context->open_io_object("/proc/self/exe");
+  REQUIRE(object->size() > 4);
+  std::array<std::uint8_t, 4> magic{};
+  auto future = context->host_read_async_io(*object, 0, magic.size(), magic.data());
+  CHECK(std::move(future).get(std::chrono::seconds{30}) == magic.size());
+  CHECK(magic == std::array<std::uint8_t, 4>{0x7f, 'E', 'L', 'F'});
+
+  context->shutdown();
+}
+
+TEST_CASE("the uring context is served by kvikIO's uring engine plugin", "[io][registry][uring]")
+{
+  // A HOST space gives the reactors their pinned staging.
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(1ULL << 30)
+    .set_per_numa_region_capacity(512ULL << 20)
+    .use_gpu_id_as_host_id();
+  memory_reservation_manager manager{builder.build()};
+  io_config config{};
+  config.uring_n_reactors = 1;
+  io_context_registry registry{config, manager};
+
+  auto context = registry.make_ioctx(io_context_type::uring);
+  REQUIRE(context != nullptr);
+  if (context->type() != io_context_type::uring) {
+    SKIP("io_uring is not usable in this process; the context fell back to cufile_posix");
+  }
+  auto* front = dynamic_cast<cucascade::io::engine_ioctx*>(context.get());
+  REQUIRE(front != nullptr);
+  CHECK(front->engine().name() == "uring");
+  CHECK(kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local) ==
+        "uring");
+  CHECK(context->can_use_fs_cache());
+  CHECK(front->engine().capabilities().priority);
+
+  auto object = context->open_io_object("/proc/self/exe");
+  std::array<std::uint8_t, 4> magic{};
+  auto future = context->host_read_async_io(*object, 0, magic.size(), magic.data());
+  CHECK(std::move(future).get(std::chrono::seconds{30}) == magic.size());
+  CHECK(magic == std::array<std::uint8_t, 4>{0x7f, 'E', 'L', 'F'});
+
+  // The engine's gauges are reached by asking the context for that interface, not by casting
+  // it to the uring context class; an interface the engine lacks is absent.
+  {
+    auto const diagnostics =
+      cucascade::io::engine_api<cucascade::io::uring::uring_diagnostics>(context);
+    REQUIRE(diagnostics != nullptr);
+    CHECK(diagnostics->reactor_gauges().size() == 1);
+    CHECK(cucascade::io::engine_api<cucascade::io::object_listing>(context) == nullptr);
+  }
+
+  // Destroying the context shuts the engine down and stops selecting it.
+  context.reset();
+  CHECK(
+    kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local).empty());
+}
+
+TEST_CASE("engine_api of no context is null", "[io][registry]")
+{
+  CHECK(cucascade::io::engine_api<cucascade::io::object_listing>(nullptr) == nullptr);
+}
+
+TEST_CASE("io_backend round-trips through its config spelling", "[io][registry][config]")
+{
+  for (auto const [name, backend] : {std::pair{"native", io_backend::native},
+                                     std::pair{"cufile", io_backend::cufile},
+                                     std::pair{"cufile_posix", io_backend::cufile_posix}}) {
+    CAPTURE(name);
+    io_backend parsed{};
+    REQUIRE(cucascade::io::string_to_enum(name, parsed));
+    CHECK(parsed == backend);
+    std::string rendered;
+    REQUIRE(cucascade::io::enum_to_string(backend, rendered));
+    CHECK(rendered == name);
+  }
+  // Names are exact: no engine names, no other case.
+  auto parsed = io_backend::cufile;
+  for (auto const* name : {"", "NATIVE", "uring", "kvikio", "posix", "cufile_reactor"}) {
+    CAPTURE(name);
+    CHECK_FALSE(cucascade::io::string_to_enum(name, parsed));
+  }
+  CHECK(parsed == io_backend::cufile);
+}
+
+// The cuFile reactors' own scratch is the one page-locked allocation outside the HOST budget;
+// the config says how large it is so a host can account for it.
+TEST_CASE("io_config reports the page-locked memory a backend allocates for itself",
+          "[io][registry][config]")
+{
+  CHECK(config_for(io_backend::native).fixed_pinned_overhead_bytes() == 0);
+  CHECK(config_for(io_backend::cufile_posix).fixed_pinned_overhead_bytes() == 0);
+#ifdef CUCASCADE_HAS_CUFILE
+  auto config = config_for(io_backend::cufile);
+  CHECK(config.fixed_pinned_overhead_bytes() == config.cufile_n_reactors * (std::size_t{16} << 20));
+  config.cufile_n_reactors = 1;
+  CHECK(config.fixed_pinned_overhead_bytes() == std::size_t{16} << 20);
+#endif
+}
+
+TEST_CASE("the registry names the backend that serves local files", "[io][registry][config]")
+{
+  CHECK(registry_fixture{}.registry.local_type() == io_context_type::uring);
+  CHECK(registry_fixture{config_for(io_backend::cufile_posix)}.registry.local_type() ==
+        io_context_type::cufile_posix);
+#ifdef CUCASCADE_HAS_CUFILE
+  CHECK(registry_fixture{config_for(io_backend::cufile)}.registry.local_type() ==
+        io_context_type::cufile);
+#endif
+}
+
+// The uring_http engine exists but cannot be created (here: an explicit fan-out larger than the
+// pool). That may be transient, so there is no backend rather than a fallback to the curl
+// engine; the fallback is for a process in which the engine's plugin cannot be loaded at all.
+TEST_CASE("a REST context that cannot be created is not replaced by the curl engine",
+          "[io][registry][rest][curl]")
+{
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(1ULL << 30)
+    .set_per_numa_region_capacity(512ULL << 20)
+    .use_gpu_id_as_host_id();
+  memory_reservation_manager manager{builder.build()};
+  io_config config{};
+  config.object_store.endpoint   = "http://127.0.0.1:9";
+  config.object_store.region     = "us-east-1";
+  config.object_store.access_key = "test-access-key";
+  config.object_store.secret_key = "test-secret-key";
+  config.rest_n_reactors         = 1;
+  config.rest.fan_out            = 64;
+  io_context_registry registry{config, manager};
+
+  CHECK(registry.make_ioctx(io_context_type::restful) == nullptr);
+  CHECK(kvikio::io::engine_registry::instance().has_factory("uring_http"));
+  CHECK(
+    kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::s3).empty());
+}
+
+// What a kvikIO engine logs reaches cuCascade's sink: here the registry's report of a
+// failed selection, which kvikIO logs as an error.
+TEST_CASE("engine logs are forwarded to the cuCascade sink", "[io][registry][log]")
+{
+  if (std::getenv("KVIKIO_LOG_LEVEL") != nullptr) {
+    SKIP("KVIKIO_LOG_LEVEL is set: kvikIO's logger is left to the user");
+  }
+  auto recorded = std::make_shared<cucascade::test::recording_sink>();
+  cucascade::test::scoped_sink const installed{recorded, cucascade::log::level::warn};
+  cucascade::io::forward_engine_logs();
+
+  CHECK_THROWS_AS(kvikio::io::engine_registry::instance().create("no_such_engine"),
+                  kvikio::io::engine_selection_error);
+  bool seen = false;
+  for (auto const& message : recorded->messages()) {
+    if (message.find("cannot create engine 'no_such_engine'") != std::string::npos) { seen = true; }
+  }
+  CHECK(seen);
+}
+
+// The uring engine exists and io_uring works, but the engine cannot be created (here: no
+// reactors). That is a configuration error, so there is no backend rather than a fallback to
+// cufile_posix; the fallback is for a process in which the engine's plugin cannot be loaded or
+// io_uring is not allowed.
+TEST_CASE("a uring context that cannot be created is not replaced by cufile_posix",
+          "[io][registry][uring]")
+{
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(1ULL << 30)
+    .set_per_numa_region_capacity(512ULL << 20)
+    .use_gpu_id_as_host_id();
+  memory_reservation_manager manager{builder.build()};
+  io_config config{};
+  config.uring_n_reactors = 1;
+  io_context_registry registry{config, manager};
+  {
+    auto usable = registry.make_ioctx(io_context_type::uring);
+    REQUIRE(usable != nullptr);
+    if (usable->type() != io_context_type::uring) {
+      SKIP("io_uring is not usable in this process; every uring context falls back");
+    }
+  }
+
+  config.uring_n_reactors = 0;
+  io_context_registry broken{config, manager};
+  CHECK(broken.make_ioctx(io_context_type::uring) == nullptr);
+  CHECK(kvikio::io::engine_registry::instance().has_factory("uring"));
+  CHECK(
+    kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::local).empty());
+}
 
 #ifdef CUCASCADE_HAS_CUFILE
 TEST_CASE("cufile routing takes local regular files only", "[io][registry][cufile]")

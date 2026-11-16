@@ -77,7 +77,13 @@ class probed_ioctx final : public rest_ioctx {
   using rest_ioctx::rest_ioctx;
   [[nodiscard]] transport_stats reactor_stats(std::size_t i = 0) const
   {
-    return _reactors.at(i)->stats();
+    return pool().reactor_stats(i);
+  }
+
+ private:
+  [[nodiscard]] kvikio::io::rest::uring_http_engine const& pool() const
+  {
+    return dynamic_cast<kvikio::io::rest::uring_http_engine const&>(engine());
   }
 };
 
@@ -85,7 +91,7 @@ std::shared_ptr<probed_ioctx> make_ioctx(loopback_range_server const& server,
                                          cucascade::io::rest::config cfg)
 {
   auto authorizer = std::make_shared<list_capable_mock_authorizer>(server.endpoint());
-  auto context    = std::make_shared<rest_reactor::reactor_context>(cfg, authorizer, nullptr);
+  auto context    = cucascade::io::rest::make_reactor_context(cfg, authorizer, nullptr);
   auto ioctx      = std::make_shared<probed_ioctx>(1, std::move(context));
   ioctx->start();
   return ioctx;
@@ -376,7 +382,7 @@ TEST_CASE("rest_ioctx loopback HTTPS GET throughput (user-space TLS, 1 GiB)",
   cfg.max_segment_bytes = 16UL << 20;
   cfg.tls.ktls          = tls::ktls_mode::prefer;
   auto authorizer       = std::make_shared<list_capable_mock_authorizer>(server.endpoint());
-  auto context          = std::make_shared<rest_reactor::reactor_context>(cfg, authorizer, nullptr);
+  auto context          = cucascade::io::rest::make_reactor_context(cfg, authorizer, nullptr);
   auto ioctx            = std::make_shared<probed_ioctx>(2, std::move(context));
   ioctx->start();
   rest_shutdown_guard cleanup{*ioctx};

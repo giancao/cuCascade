@@ -302,7 +302,7 @@ struct fs_cache::cached_copy_retirement {
     if (status == cudaSuccess) {
       coordinator->on_complete();
     } else {
-      coordinator->report_error(status);
+      coordinator->report_error(to_driver_status(status));
     }
   }
 };
@@ -1207,16 +1207,15 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
               needed_fill(off, _chunk_size, needed.offset, needed.end()), fill)) {
           claimed.push_back(chunk);
           auto completion = std::make_shared<prepared_io_completion>(
-            [this, needed, piece_dst, lifetime](std::span<cached_chunk* const> completed,
+            [this, needed, piece_dst, lifetime](std::span<fragment_handle const> completed,
                                                 bool host_ok) noexcept {
               std::ignore = lifetime;
               if (!host_ok) {
-                for (auto* current : completed) {
-                  std::ignore = current->state.mark_load_failed();
-                }
+                publish_chunk_fill(completed, false);
                 return;
               }
-              for (auto* current : completed) {
+              for (auto* handle : completed) {
+                auto* current       = chunk_of(handle);
                 auto const copy_rng = intersect(needed, range{current->offset, _chunk_size});
                 if (!copy_rng.empty()) {
                   std::memcpy(piece_dst + (copy_rng.offset - needed.offset),
@@ -1224,11 +1223,9 @@ exec::semi_future<std::size_t> fs_cache::host_read_ranges_async(const io_object&
                               copy_rng.size);
                 }
               }
-              for (auto* current : completed) {
-                std::ignore = current->state.mark_cached();
-              }
+              publish_chunk_fill(completed, true);
             });
-          prepared_io_slice io_slice{needed, host_buffer{std::vector<cached_chunk*>{chunk}}};
+          prepared_io_slice io_slice{needed, make_fragment_buffer(chunk, fill, _chunk_size)};
           io_slice.on_complete = std::move(completion);
           prepared.push_back(std::move(io_slice));
           ++n_loads;
@@ -1357,7 +1354,7 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
     lifetime   = std::make_shared<exec::completion_controller::slot>(std::move(admission));
     generation = generation_for(obj, handle);
     completion = std::make_shared<prepared_io_completion>(
-      [lifetime](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
+      [lifetime](std::span<fragment_handle const> completed, bool host_ok) noexcept {
         std::ignore = lifetime;
         publish_chunk_fill(completed, host_ok);
       });
@@ -1404,15 +1401,15 @@ exec::semi_future<std::size_t> fs_cache::device_read_ranges_async(
               needed_fill(off, _chunk_size, needed.offset, needed.end()), fill)) {
           claimed.push_back(chunk);
           prepared_io_slice io_slice{needed,
-                                     host_buffer{std::vector<cached_chunk*>{chunk}},
-                                     device_buffer{device_dst, stream, device_id.value()}};
+                                     make_fragment_buffer(chunk, fill, _chunk_size),
+                                     device_buffer{device_dst, stream.get(), device_id.value()}};
           io_slice.on_complete = completion;
           prepared.push_back(std::move(io_slice));
           ++loads;
           continue;
         }
 
-        prepared.emplace_back(needed, device_buffer{device_dst, stream, device_id.value()});
+        prepared.emplace_back(needed, device_buffer{device_dst, stream.get(), device_id.value()});
         ++misses;
       }
     }
@@ -1799,7 +1796,7 @@ bool fs_cache::prefetch(cache_handle& handle,
         covered = covered && covers(fill, c->offset, _chunk_size, needed_lo, needed_hi);
         claimed_chunks.push_back(c);
         prepared.emplace_back(range{seg_lo, seg_hi - seg_lo},
-                              host_buffer{std::vector<cached_chunk*>{c}});
+                              make_fragment_buffer(c, fill, _chunk_size));
       } else if (covered) {
         // Read state and extent together. A loading chunk belongs to another
         // IO, whose completion this prefetch does not observe. Never promote
@@ -1824,7 +1821,7 @@ bool fs_cache::prefetch(cache_handle& handle,
     if (!admission) { throw std::runtime_error("fs_cache is shutting down"); }
     auto lifetime   = std::make_shared<exec::completion_controller::slot>(std::move(admission));
     auto completion = std::make_shared<prepared_io_completion>(
-      [lifetime](std::span<cached_chunk* const> completed, bool host_ok) noexcept {
+      [lifetime](std::span<fragment_handle const> completed, bool host_ok) noexcept {
         std::ignore = lifetime;
         publish_chunk_fill(completed, host_ok);
       });
