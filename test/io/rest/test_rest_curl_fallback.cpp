@@ -22,6 +22,7 @@
 #include "loopback_range_server.hpp"
 #include "rest_contract_test_utils.hpp"
 
+#include <cucascade/io/cache/types.hpp>
 #include <cucascade/io/engine_ioctx.hpp>
 #include <cucascade/io/host_staging_source.hpp>
 #include <cucascade/io/io_errors.hpp>
@@ -45,7 +46,10 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -223,4 +227,77 @@ TEST_CASE("the curl engine keeps the read contracts through a REST context", "[r
     CHECK(std::all_of(after.begin(), after.end(), [](std::uint8_t b) { return b == 0xEE; }));
     CHECK(mr.get_free_blocks() == mr.get_total_blocks());
   }
+}
+
+// What the fs_cache relies on: the engine hands a chunk back when the range request that filled
+// it finishes, not when the whole read does. One range is small enough to be answered at once,
+// the other is held by the server halfway through its body.
+TEST_CASE("the curl engine publishes each cache chunk when its own range request finishes",
+          "[rest][curl]")
+{
+  using cucascade::io::cache::cached_chunk;
+  using cucascade::io::cache::chunk_fill;
+  using cucascade::io::cache::chunk_state;
+  constexpr std::size_t small_bytes = 4096;
+  constexpr std::size_t large_bytes = 64 * 1024;
+  constexpr std::size_t large_at    = 128 * 1024;
+  auto const payload                = cucascade::test::rest_test_payload(256 * 1024);
+  // Declared before the context: they outlive it on every exit path.
+  std::vector<std::uint8_t> small_memory(small_bytes, 0xEE);
+  std::vector<std::uint8_t> large_memory(large_bytes, 0xEE);
+  cached_chunk small{0};
+  cached_chunk large{large_at};
+
+  auto control = std::make_shared<cucascade::test::range_response_control>();
+  cucascade::test::range_fault_policy fault{};
+  fault.body =
+    cucascade::test::response_body_policy{.hold_after_bytes = 2 * small_bytes, .control = control};
+  loopback_range_server server{payload, fault};
+  auto context = cucascade::io::rest::make_curl_rest_ioctx(store_for(server), nullptr);
+  auto object  = context->open_io_object("s3://bucket/object.bin", payload.size());
+  // Released before the context goes away, so a failed check cannot leave the read held.
+  cucascade::test::response_release_guard const release{control};
+
+  // Two chunks claimed for loading, as the fs_cache hands them to a backend.
+  auto const claim = [](cached_chunk& chunk, std::uint8_t* memory) {
+    chunk.data = memory;
+    REQUIRE(chunk.state.mark_queued());
+    REQUIRE(chunk.state.mark_allocated());
+    chunk_fill fill;
+    REQUIRE(chunk.state.take_loading_merging(chunk_fill::whole(), fill));
+    return fill;
+  };
+  auto completion = std::make_shared<cucascade::io::prepared_io_completion>(
+    [](std::span<cucascade::io::fragment_handle const> completed, bool ok) noexcept {
+      cucascade::io::cache::publish_chunk_fill(completed, ok);
+    });
+  std::vector<cucascade::io::prepared_io_slice> slices;
+  slices.emplace_back(cucascade::io::range{0, small_bytes},
+                      cucascade::io::cache::make_fragment_buffer(
+                        &small, claim(small, small_memory.data()), small_bytes));
+  slices.back().on_complete = completion;
+  slices.emplace_back(cucascade::io::range{large_at, large_bytes},
+                      cucascade::io::cache::make_fragment_buffer(
+                        &large, claim(large, large_memory.data()), large_bytes));
+  slices.back().on_complete = completion;
+
+  auto future = context->mixed_readv_async_io(*object, std::move(slices));
+
+  // The small range is answered in full; the large one stops in the server.
+  REQUIRE(control->wait_for_holds(1, 10s));
+  auto const deadline = std::chrono::steady_clock::now() + 10s;
+  while (small.state.get_state() != chunk_state::cached &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(5ms);
+  }
+  CHECK(small.state.get_state() == chunk_state::cached);
+  CHECK(std::equal(small_memory.begin(), small_memory.end(), payload.begin()));
+  CHECK(large.state.get_state() == chunk_state::loading);
+  CHECK_FALSE(future.is_ready());
+
+  control->release_all();
+  REQUIRE(std::move(future).get(30s) == small_bytes + large_bytes);
+  CHECK(large.state.get_state() == chunk_state::cached);
+  CHECK(std::equal(large_memory.begin(), large_memory.end(), payload.begin() + large_at));
+  CHECK(server.get_count() == 2);
 }

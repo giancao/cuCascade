@@ -17,6 +17,7 @@
 
 #include "io/detail/local_descriptor.hpp"
 #include "utils/child_test_runner.hpp"
+#include "utils/page_cache_check.hpp"
 
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_errors.hpp>
@@ -141,7 +142,6 @@ class scratch_path {
   std::filesystem::path _path;
 };
 
-/** The expected file contents: writes applied to a byte vector. */
 /// What a backend writing with O_DIRECT stores for bytes whose last block is partial: the block
 /// is completed with zeros, so the file ends on a block boundary.
 [[nodiscard]] std::vector<std::uint8_t> block_padded(std::vector<std::uint8_t> bytes)
@@ -150,6 +150,7 @@ class scratch_path {
   return bytes;
 }
 
+/** The expected file contents: writes applied to a byte vector. */
 class shadow_file {
  public:
   void write(std::size_t offset, std::span<std::uint8_t const> bytes)
@@ -627,7 +628,6 @@ TEST_CASE("uring host_write round-trips aligned and unaligned ranges", "[io][uri
         auto const bytes = pattern(size, ++seed);
         host_bytes source{bytes, misalignment};
         // Spread the writes so they land on fresh ranges and on earlier ones.
-        // Spread the writes so they land on fresh ranges and on earlier ones.
         auto const at = offset + (seed % 5) * 2 * MiB;
         // With O_DIRECT a write starts on a block boundary, and may end inside a block only
         // when none of the file's data lies behind it; anything else is rejected, untouched.
@@ -644,6 +644,7 @@ TEST_CASE("uring host_write round-trips aligned and unaligned ranges", "[io][uri
       }
     }
   }
+  cucascade::test::check_page_cache_matches_disk(path.str());
   auto const expected = shadow.bytes();
   CHECK((path.contents() == expected));
   CHECK((read_back(ctx.get(), path.str()) == expected));
@@ -696,6 +697,8 @@ TEST_CASE("uring a request of unaligned slices is written as whole blocks",
   auto const expected = block_padded(shadow.bytes());
   CHECK(object->size() == expected.size());
   CHECK(std::filesystem::file_size(path.str()) == expected.size());
+  // No page of the file is left in the page cache with other bytes than the disk has.
+  cucascade::test::check_page_cache_matches_disk(path.str());
   CHECK((path.contents() == expected));                   // through the page cache
   CHECK((read_back(ctx.get(), path.str()) == expected));  // through the backend
 }
@@ -771,6 +774,7 @@ TEST_CASE("uring asynchronous host and device writes round-trip", "[io][uring][w
       CHECK(object->size() == shadow.bytes().size());
     }
   }
+  cucascade::test::check_page_cache_matches_disk(path.str());
   auto const expected = shadow.bytes();
   // Compared as a flag: on a mismatch Catch2 would print both multi-megabyte vectors.
   CHECK((read_back(ctx.get(), path.str()) == expected));
