@@ -156,6 +156,15 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   twice throws.
 - `disk_data_representation` deletes its file on destruction, and its `clone()` always throws;
   materialize to another tier through a converter.
+- A backend that writes with O_DIRECT (`write_alignment_requirement() > 1`, i.e. uring or the cuFile
+  reactor with `use_odirect`) is handed whole blocks only, and `ioctx`'s write entry points judge
+  a request as a whole (rules in the comment in `io_context.hpp`): every block it touches must be
+  written from its first byte on, without holes, so a request starts on a block boundary; slices
+  need not be aligned, a block that takes bytes from several slices is assembled in host memory
+  and written in the same request; a request may stop inside a block only where the file has no
+  data, and the rest of that block is zeros, so files end on a block boundary. Anything else is
+  `std::invalid_argument` before anything is written. Nothing is read back, nothing is kept
+  between requests, no lock. Without O_DIRECT writes reach the backend unchanged.
 - The DISK converters hand the io context whole blocks only (`disk_block_size()`, 4 KiB): buffers
   start on block boundaries and the partial last block of each is padded with zeros in host
   memory (`disk_edge_blocks`). Do not write a partial block: an io stack using O_DIRECT would

@@ -118,6 +118,10 @@ class engine_ioctx : public ioctx {
   {
     return _caps.min_alignment;
   }
+  [[nodiscard]] std::size_t write_alignment_requirement() const noexcept override
+  {
+    return _caps.write_alignment;
+  }
   [[nodiscard]] std::size_t merge_gap_size() const noexcept override { return _caps.merge_gap; }
   [[nodiscard]] std::size_t n_max_concurrent_scans() const noexcept override
   {

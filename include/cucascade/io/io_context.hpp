@@ -610,6 +610,50 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     if (object != nullptr) _metadata_store.stamp(*object);
     return object;
   }
+
+  // -- Writes that do not cover whole blocks ---------------------------------
+  //
+  // Only for a backend that writes with O_DIRECT: @ref write_alignment_requirement
+  // is above 1 exactly then. Any other backend gets every write as the caller
+  // made it.
+  //
+  // O_DIRECT writes whole blocks, each from one piece of memory, and writing
+  // the rest of a file through the page cache instead can leave stale pages
+  // there. So such a backend is handed whole blocks only, and a request is
+  // judged as a whole, not slice by slice:
+  //
+  //  1. Every block the request touches must be written from its first byte
+  //     on, without holes. In particular the request starts on a block
+  //     boundary: the bytes in front of it are never made up.
+  //  2. Its slices need not be aligned. A block that takes its bytes from more
+  //     than one slice (a header followed by payloads, say) is assembled in
+  //     host memory and written with the rest, in the same request.
+  //  3. The request may stop before the end of a block (the end of a buffer,
+  //     the end of the file) only where the file has no data: the rest of the
+  //     block is zeros, and the file ends on a block boundary.
+  //  4. Anything else fails with std::invalid_argument before anything is
+  //     written.
+  //
+  // Nothing is read from the file, nothing is kept between requests, and no
+  // lock is taken. The caller records how long its data is.
+
+ public:
+  /// The unit a write must start on and cover whole multiples of for the backend
+  /// to write it directly. Above 1 only when the backend writes with O_DIRECT;
+  /// 1 (the default) means writes have no alignment requirement.
+  [[nodiscard]] virtual std::size_t write_alignment_requirement() const noexcept { return 1; }
+
+ private:
+  struct write_edge_state;
+  std::unique_ptr<write_edge_state> _write_edges;
+
+ public:
+  /// What the front end did for requests that were not block aligned.
+  struct write_edge_counters {
+    std::uint64_t gathered_blocks{0};  ///< blocks assembled from the ends of slices
+    std::uint64_t padded_blocks{0};    ///< of those, last blocks completed with zeros
+  };
+  [[nodiscard]] write_edge_counters write_edge_stats() const noexcept;
 };
 
 }  // namespace cucascade::io
