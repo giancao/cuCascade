@@ -66,10 +66,12 @@ namespace detail {
   memory::memory_space const& disk_space);
 
 /**
- * @brief Write device buffers into an existing (freshly created) batch file and wait.
+ * @brief Write device buffers, and the host blocks that complete them, into an existing (freshly
+ *        created) batch file and wait.
  *
- * One device_writev_async on @p stream: the write observes all work enqueued on @p stream before
- * the call. Must be called with the source device current.
+ * One mixed_writev_async on @p stream: the device slices observe all work enqueued on @p stream
+ * before the call; the host slices must already hold their bytes. Must be called with the source
+ * device current.
  *
  * @param file_size Size the file will have; used as a preallocation hint.
  * @throws std::logic_error if @p ctx cannot write device memory.
@@ -77,7 +79,8 @@ namespace detail {
  */
 void write_disk_file_device(io::ioctx& ctx,
                             std::string const& path,
-                            std::span<io::write_slice const> slices,
+                            std::span<io::write_slice const> host_slices,
+                            std::span<io::write_slice const> device_slices,
                             ::cuda::stream_ref stream,
                             std::size_t file_size);
 

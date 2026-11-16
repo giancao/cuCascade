@@ -49,6 +49,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -243,6 +244,80 @@ class failing_write_ioctx final : public io::ioctx {
     throw std::runtime_error("failing_write_ioctx: no reads");
   }
   // create_io_object_for_write keeps the base default: std::errc::not_supported.
+};
+
+/// One write slice a converter handed to the io context.
+struct recorded_write {
+  std::size_t offset;
+  std::size_t size;
+  bool device;
+};
+
+/**
+ * @brief An io context that accepts every write without doing it and records its slices, to
+ *        check what the DISK converters ask an io stack to write.
+ */
+class recording_write_ioctx final : public io::ioctx {
+ public:
+  [[nodiscard]] io::io_context_type type() const noexcept override
+  {
+    return io::io_context_type::uring;
+  }
+  void shutdown() noexcept override {}
+  [[nodiscard]] bool supports(std::string_view) const noexcept override { return true; }
+  [[nodiscard]] bool supports_device_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_host_to_device_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_vector_host_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_device_range_read() const noexcept override { return false; }
+  [[nodiscard]] bool supports_write() const noexcept override { return true; }
+  [[nodiscard]] bool supports_device_write() const noexcept override { return true; }
+  [[nodiscard]] std::vector<io::byte_range> align_and_coalesce(
+    std::span<io::byte_range const>, std::optional<std::size_t>) const noexcept override
+  {
+    return {};
+  }
+  std::size_t host_read_io(io::io_object const&, std::size_t, std::size_t, std::uint8_t*) override
+  {
+    throw std::runtime_error("recording_write_ioctx: no reads");
+  }
+  exec::semi_future<std::size_t> mixed_readv_async_io(
+    io::io_object const&, std::vector<io::prepared_io_slice>&&) noexcept override
+  {
+    return exec::make_semi_future<std::size_t>(
+      std::make_exception_ptr(std::runtime_error("recording_write_ioctx: no reads")));
+  }
+  exec::semi_future<std::size_t> mixed_writev_async_io(
+    io::io_object const&, std::vector<io::prepared_io_slice>&& slices) noexcept override
+  {
+    std::size_t total = 0;
+    for (auto const& slice : slices) {
+      writes.push_back({slice.rng.offset, slice.rng.size, slice.has_device_request()});
+      total += slice.rng.size;
+    }
+    return exec::make_semi_future<std::size_t>(std::size_t{total});
+  }
+
+  std::vector<recorded_write> writes;
+
+ protected:
+  struct writable_object final : io::io_object {
+    explicit writable_object(std::string path) : _path(std::move(path)) {}
+    [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _path; }
+    [[nodiscard]] std::string const& object_path() const noexcept override { return _path; }
+    [[nodiscard]] std::size_t size() const noexcept override { return 0; }
+    [[nodiscard]] bool writable() const noexcept override { return true; }
+    std::string _path;
+  };
+
+  std::shared_ptr<io::io_object> create_io_object(std::string) override
+  {
+    throw std::runtime_error("recording_write_ioctx: no reads");
+  }
+  std::shared_ptr<io::io_object> create_io_object_for_write(std::string path,
+                                                            io::write_open_options) override
+  {
+    return std::make_shared<writable_object>(std::move(path));
+  }
 };
 
 }  // namespace
@@ -514,6 +589,74 @@ TEST_CASE("a failed disk write leaves no batch file behind", "[disk][io][error]"
     *gpu_rep, shared_host_space().get(), shared_stream());
   REQUIRE_THROWS(registry().convert<disk_data_representation>(*host_rep, &space, shared_stream()));
   REQUIRE(dir.file_count() == 0);
+}
+
+// An io stack that writes with O_DIRECT can only write whole blocks that way; anything shorter
+// goes through the page cache. Writing one file both ways at once can leave stale pages in the
+// page cache (zeros where the disk holds the data), which a later buffered read returns. So the
+// converters hand over whole blocks only: the partial last block of every buffer is padded.
+TEST_CASE("the disk converters write whole blocks only", "[disk][io][layout]")
+{
+  constexpr std::size_t block = 4096;
+  scratch_dir dir;
+  auto context = std::make_shared<recording_write_ioctx>();
+  memory::disk_memory_space_config config;
+  config.disk_id         = 16;
+  config.memory_capacity = 1UL << 30;
+  config.mount_paths     = dir.string();
+  config.io_context      = context;
+  memory::memory_space space(config);
+
+  // Rows chosen so that no buffer ends on a block boundary, and enough of them that the host
+  // representation spans several host blocks (a buffer is then cut inside a block).
+  auto const rows = GENERATE(as<cudf::size_type>{}, 1, 511, 300'001);
+  CAPTURE(rows);
+  auto gpu_rep  = make_gpu_rep(make_sequence_table(rows, 3, shared_stream()));
+  auto host_rep = registry().convert<host_data_representation>(
+    *gpu_rep, shared_host_space().get(), shared_stream());
+  auto const data_bytes = static_cast<std::size_t>(rows) * 3 * sizeof(std::int64_t);
+
+  for (bool const from_device : {true, false}) {
+    CAPTURE(from_device);
+    context->writes.clear();
+    auto disk_rep =
+      from_device
+        ? registry().convert<disk_data_representation>(*gpu_rep, &space, shared_stream())
+        : registry().convert<disk_data_representation>(*host_rep, &space, shared_stream());
+
+    REQUIRE_FALSE(context->writes.empty());
+    std::size_t written = 0;
+    for (auto const& write : context->writes) {
+      CAPTURE(write.offset, write.size, write.device);
+      CHECK(write.offset % block == 0);
+      CHECK(write.size % block == 0);
+      CHECK(write.size != 0);
+      written += write.size;
+    }
+    // Whole blocks, no overlap, nothing missing: together they are exactly the file.
+    auto sorted = context->writes;
+    std::ranges::sort(sorted, {}, &recorded_write::offset);
+    std::size_t end = 0;
+    for (auto const& write : sorted) {
+      CHECK(write.offset == end);
+      end = write.offset + write.size;
+    }
+    CHECK(end == disk_rep->get_size_in_bytes());
+    CHECK(written == disk_rep->get_size_in_bytes());
+    CHECK(written >= data_bytes);
+    CHECK(written % block == 0);
+    // The device path writes the bulk straight from device memory: the host slices are single
+    // blocks, at most one per buffer (a column has a data buffer and may have a null mask).
+    if (from_device) {
+      std::size_t host_blocks = 0;
+      for (auto const& write : context->writes) {
+        if (write.device) { continue; }
+        CHECK(write.size == block);
+        ++host_blocks;
+      }
+      CHECK(host_blocks <= 2 * 3);
+    }
+  }
 }
 
 TEST_CASE("a truncated or missing batch file fails the read", "[disk][io][error]")

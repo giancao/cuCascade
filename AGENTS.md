@@ -153,6 +153,12 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   twice throws.
 - `disk_data_representation` deletes its file on destruction, and its `clone()` always throws;
   materialize to another tier through a converter.
+- The DISK converters hand the io context whole blocks only (`disk_block_size()`, 4 KiB): buffers
+  start on block boundaries and the partial last block of each is padded with zeros in host
+  memory (`disk_edge_blocks`). Do not write a partial block: an io stack using O_DIRECT would
+  write it through the page cache next to blocks it writes directly, and mixing the two on one
+  file can leave stale zero pages in the page cache that a later buffered read returns (seen on
+  XFS, kernel 6.11). `[disk][io][layout]` checks the slices.
 - A repository's ordering mode (`ORDERED` / `UNORDERED`) is set by its first insertion, applies to
   all partitions and is never reset; mixing `add_data_batch` and `add_data_batch_at_position`
   throws. New methods follow the public-locks / protected `*_unlocked` hook pattern. Pops and

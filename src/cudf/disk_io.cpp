@@ -109,7 +109,8 @@ std::shared_ptr<io::ioctx> resolve_disk_io_context(memory::memory_space const& d
 
 void write_disk_file_device(io::ioctx& ctx,
                             std::string const& path,
-                            std::span<io::write_slice const> slices,
+                            std::span<io::write_slice const> host_slices,
+                            std::span<io::write_slice const> device_slices,
                             ::cuda::stream_ref stream,
                             std::size_t file_size)
 {
@@ -117,10 +118,10 @@ void write_disk_file_device(io::ioctx& ctx,
     throw std::logic_error(
       "disk tier: the io context of the DISK memory space cannot write device memory");
   }
-  if (slices.empty()) { return; }
-  auto const expected = total_bytes(slices);
+  if (host_slices.empty() && device_slices.empty()) { return; }
+  auto const expected = total_bytes(host_slices) + total_bytes(device_slices);
   auto const object   = ctx.open_io_object_for_write(path, batch_file_open_options(file_size));
-  await_on_unwind request{ctx.device_writev_async(*object, slices, stream)};
+  await_on_unwind request{ctx.mixed_writev_async(*object, host_slices, device_slices, stream)};
   check_transferred(request.get(), expected, "write", path);
 }
 
