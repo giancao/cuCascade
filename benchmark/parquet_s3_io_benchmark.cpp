@@ -36,6 +36,7 @@
 // AWS_DEFAULT_REGION, AWS_ENDPOINT_URL).
 
 #include <cucascade/exec/semi_future.hpp>
+#include <cucascade/io/host_staging_source.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/rest/authorizer.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
@@ -84,14 +85,15 @@ static const std::vector<std::string> COLUMNS = {
   "l_shipdate",
 };
 
-enum class Backend { rest };
+enum class Backend { rest, curl };
 enum class Dest { host, device };
 
 static Backend parse_backend(std::string_view s)
 {
   if (s == "rest") return Backend::rest;
+  if (s == "curl") return Backend::curl;
   throw std::invalid_argument(std::string("unknown backend: ") + std::string(s) +
-                              "  (expected: rest)");
+                              "  (expected: rest | curl)");
 }
 
 static Dest parse_dest(std::string_view s)
@@ -106,11 +108,13 @@ static void usage(char const* prog)
 {
   std::cerr
     << "usage: " << prog
-    << " <bucket> <prefix> <rest> <host|device> <num_rows> [n_threads] [key=value ...]\n"
+    << " <bucket> <prefix> <rest|curl> <host|device> <num_rows> [n_threads] [key=value ...]\n"
     << "  bucket     – S3 bucket name (no scheme)\n"
     << "  prefix     – key prefix to list ('-' for the whole bucket); only\n"
     << "               keys ending in .parquet are read\n"
     << "  rest       – native REST reactor (host=vector-io, device=host->device)\n"
+    << "  curl       – the same reads through kvikIO's built-in curl engine; credentials and\n"
+    << "               region from the AWS_* environment variables\n"
     << "  host|device– destination tier the ranges are read into\n"
     << "  num_rows   – rows to read (0 = all)\n"
     << "  n_threads  – reader threads / REST reactors (default 2)\n"
@@ -261,8 +265,7 @@ int main(int argc, char** argv)
   std::string prefix       = argv[2];
   if (prefix == "-") { prefix.clear(); }
 
-  // Validated only: the REST reactor is the one backend.
-  [[maybe_unused]] Backend backend;
+  Backend backend;
   Dest dest;
   try {
     backend = parse_backend(argv[3]);
@@ -368,7 +371,19 @@ int main(int argc, char** argv)
   std::shared_ptr<cucascade::io::ioctx> io_ctx;
   std::vector<std::shared_ptr<cucascade::io::io_object>> io_objects;
 
-  {
+  if (backend == Backend::curl) {
+    // kvikIO's built-in engine behind the same REST context; an empty store leaves the AWS_*
+    // environment variables in charge of the endpoint, region and credentials.
+    std::cout << "CURL   : kvikIO curl engine\n";
+    auto context = cucascade::io::rest::make_curl_rest_ioctx(
+      cucascade::io::object_store_config{},
+      std::make_shared<cucascade::io::host_staging_source>(host_mr));
+    io_ctx = context;
+    io_ctx->start();
+    io_objects.reserve(keys.size());
+    for (auto const& key : keys)
+      io_objects.push_back(io_ctx->open_io_object("s3://" + bucket + "/" + key));
+  } else {
     std::cout << "REST   : n_reactors=" << n_threads
               << "  max_connections=" << rest_cfg.max_connections << "\n";
     auto authorizer = std::make_shared<awssdk_presigned_authorizer>(s3_client);
