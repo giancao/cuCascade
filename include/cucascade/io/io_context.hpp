@@ -610,6 +610,49 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
     if (object != nullptr) _metadata_store.stamp(*object);
     return object;
   }
+
+  // -- Writes that do not cover whole blocks ---------------------------------
+  //
+  // A backend that writes with O_DIRECT (@ref min_alignment_requirement above 1)
+  // can only write whole blocks that way. It is never handed less: the front
+  // end completes the first and the last block of a write that is not block
+  // aligned and writes them whole, so no part of a file goes through the page
+  // cache while the rest is written directly (mixing the two can leave stale
+  // pages in the page cache).
+  //
+  // The rule for callers: start a file at a block boundary and write it front
+  // to back. The unfinished last block of a write is remembered per object, so
+  // the next write that continues in that block is merged with it in memory.
+  // Any other partial block is completed from the file (a read), or with zeros
+  // past the end of the file. A file written this way ends on a block boundary.
+
+  /// Host bytes of a write that share a block with other bytes.
+  struct write_edge_piece {
+    std::size_t offset;
+    std::size_t size;
+    const std::uint8_t* src;
+  };
+
+  /// Completes and writes the blocks @p pieces fall in, on the calling thread.
+  /// @p whole_ranges are the block-aligned ranges of the same write.
+  void write_edge_blocks(const io_object& obj,
+                         std::vector<write_edge_piece>& pieces,
+                         std::span<const range> whole_ranges);
+
+  /// A whole-block write over the remembered last block makes the remembered copy stale.
+  void forget_overwritten_edge(const io_object& obj, std::span<const range> whole_ranges);
+
+  struct write_edge_state;
+  std::unique_ptr<write_edge_state> _write_edges;
+
+ public:
+  /// How the partial blocks of unaligned writes were completed so far.
+  struct write_edge_counters {
+    std::uint64_t merged_from_memory{0};  ///< continued the remembered last block
+    std::uint64_t read_from_file{0};      ///< the block had to be read back
+    std::uint64_t zero_filled{0};         ///< a new block past the end of the file
+  };
+  [[nodiscard]] write_edge_counters write_edge_stats() const noexcept;
 };
 
 }  // namespace cucascade::io

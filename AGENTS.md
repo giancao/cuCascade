@@ -156,6 +156,13 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   twice throws.
 - `disk_data_representation` deletes its file on destruction, and its `clone()` always throws;
   materialize to another tier through a converter.
+- A backend that writes with O_DIRECT is never handed a partial block: `ioctx`'s write entry
+  points complete the first and last block of an unaligned write and write them whole
+  (`write_edge_blocks` in `io_context.cpp`). Callers should start a file on a block boundary and
+  write front to back: the unfinished last block is remembered per object and merged with the
+  next write in memory; any other partial block is read back from the file (the slow path). Those
+  blocks are written synchronously on the calling thread, a file ends on a block boundary, and
+  `write_edge_stats()` counts the three cases.
 - The DISK converters hand the io context whole blocks only (`disk_block_size()`, 4 KiB): buffers
   start on block boundaries and the partial last block of each is padded with zeros in host
   memory (`disk_edge_blocks`). Do not write a partial block: an io stack using O_DIRECT would

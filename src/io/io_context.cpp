@@ -21,22 +21,31 @@
 #include <cucascade/io/cache/fs_cache.hpp>
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_errors.hpp>
+#include <cucascade/io/io_request.hpp>
 #include <cucascade/io/types.hpp>
 #include <cucascade/log/logging.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -91,8 +100,148 @@ void require_writable(ioctx const& ctx, io_object const& obj, bool device, char 
 
 }  // namespace
 
-ioctx::ioctx()  = default;
+namespace {
+
+struct free_block {
+  void operator()(std::uint8_t* memory) const noexcept { std::free(memory); }
+};
+using block_image = std::unique_ptr<std::uint8_t, free_block>;
+
+[[nodiscard]] block_image make_block_image(std::size_t block)
+{
+  auto* memory = static_cast<std::uint8_t*>(std::aligned_alloc(block, block));
+  if (memory == nullptr) throw std::bad_alloc();
+  return block_image{memory};
+}
+
+}  // namespace
+
+/// What the front end remembers of the writable objects' unfinished last blocks.
+struct ioctx::write_edge_state {
+  struct entry {
+    std::weak_ptr<const io_object> object;
+    std::mutex mutex;  ///< serializes the partial-block writes of one object
+    bool has_block{false};
+    std::size_t block_offset{0};
+    block_image image;
+  };
+
+  std::mutex mutex;
+  std::unordered_map<std::uint64_t, std::shared_ptr<entry>> entries;  ///< by open generation
+  /// Set once any object has a remembered block: aligned-only writers never take a lock.
+  std::atomic<bool> any_remembered{false};
+  std::atomic<std::uint64_t> merged_from_memory{0};
+  std::atomic<std::uint64_t> read_from_file{0};
+  std::atomic<std::uint64_t> zero_filled{0};
+
+  [[nodiscard]] std::shared_ptr<entry> entry_of(const io_object& obj)
+  {
+    std::lock_guard lock(mutex);
+    auto& slot = entries[obj.open_generation()];
+    if (slot == nullptr) {
+      // Objects have no close hook: drop the entries of those that are gone.
+      if (entries.size() % 64 == 0) {
+        std::erase_if(entries, [&](auto const& item) {
+          return item.second != nullptr && item.second->object.expired();
+        });
+      }
+      auto created                   = std::make_shared<entry>();
+      created->object                = obj.weak_from_this();
+      entries[obj.open_generation()] = created;
+      return created;
+    }
+    return slot;
+  }
+};
+
+ioctx::ioctx() : _write_edges(std::make_unique<write_edge_state>()) {}
 ioctx::~ioctx() = default;
+
+void ioctx::forget_overwritten_edge(const io_object& obj, std::span<const range> whole_ranges)
+{
+  if (!_write_edges->any_remembered.load(std::memory_order_acquire)) return;
+  auto const block = std::max(min_alignment_requirement(), write_granule());
+  auto const state = _write_edges->entry_of(obj);
+  std::lock_guard lock(state->mutex);
+  for (auto const& whole : whole_ranges) {
+    if (state->has_block && whole.offset <= state->block_offset &&
+        state->block_offset + block <= whole.end()) {
+      state->has_block = false;
+    }
+  }
+}
+
+ioctx::write_edge_counters ioctx::write_edge_stats() const noexcept
+{
+  return {_write_edges->merged_from_memory.load(std::memory_order_relaxed),
+          _write_edges->read_from_file.load(std::memory_order_relaxed),
+          _write_edges->zero_filled.load(std::memory_order_relaxed)};
+}
+
+void ioctx::write_edge_blocks(const io_object& obj,
+                              std::vector<write_edge_piece>& pieces,
+                              std::span<const range> whole_ranges)
+{
+  auto const block = std::max(min_alignment_requirement(), write_granule());
+  std::ranges::sort(pieces, {}, &write_edge_piece::offset);
+  auto const state = _write_edges->entry_of(obj);
+  std::lock_guard lock(state->mutex);
+
+  // A whole-block write over the remembered block makes the copy stale.
+  for (auto const& whole : whole_ranges) {
+    if (state->has_block && whole.offset <= state->block_offset &&
+        state->block_offset + block <= whole.end()) {
+      state->has_block = false;
+    }
+  }
+
+  auto image = make_block_image(block);
+  for (std::size_t i = 0; i < pieces.size();) {
+    auto const at = pieces[i].offset - pieces[i].offset % block;
+    if (state->has_block && state->block_offset == at) {
+      std::memcpy(image.get(), state->image.get(), block);
+      _write_edges->merged_from_memory.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      std::memset(image.get(), 0, block);
+      if (auto const size = obj.size(); at < size) {
+        // Not the block this object's last write ended in: complete it from the file.
+        // Read a whole block the way it was written (the backend's asynchronous read is
+        // O_DIRECT for an aligned block); the plain read serves a file that ends inside the
+        // block, and a backend whose reactors cannot run.
+        auto const present = std::min(block, size - at);
+        std::size_t got    = 0;
+        bool have          = false;
+        if (present == block) {
+          try {
+            got  = host_read_async_io(obj, at, block, image.get()).get();
+            have = true;
+          } catch (...) {
+            have = false;
+          }
+        }
+        if (!have) got = host_read_io(obj, at, present, image.get());
+        if (got != present) {
+          throw_errc(std::errc::io_error, "ioctx: short read completing a partial block");
+        }
+        _write_edges->read_from_file.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        _write_edges->zero_filled.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    for (; i < pieces.size() && pieces[i].offset < at + block; ++i) {
+      std::memcpy(image.get() + (pieces[i].offset - at), pieces[i].src, pieces[i].size);
+    }
+    if (host_write_io(obj, at, block, image.get()) != block) {
+      throw_errc(std::errc::io_error, "ioctx: short write of a completed block");
+    }
+    // Remember the block written last: a write that continues the file starts in it.
+    if (state->image == nullptr) state->image = make_block_image(block);
+    std::memcpy(state->image.get(), image.get(), block);
+    state->block_offset = at;
+    state->has_block    = true;
+    _write_edges->any_remembered.store(true, std::memory_order_release);
+  }
+}
 
 void ioctx::initialize_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
@@ -313,7 +462,28 @@ std::size_t ioctx::host_write(const io_object& obj,
   // catches a prefetch that read pre-write bytes while the write ran.
   invalidate_cached(obj.object_path());
   try {
-    auto const written = host_write_io(obj, offset, size, src);
+    std::size_t written = 0;
+    auto const block    = std::max(min_alignment_requirement(), write_granule());
+    if (min_alignment_requirement() > 1 && (offset % block != 0 || size % block != 0)) {
+      // Never hand the backend less than a block: see write_edge_blocks.
+      auto const end = offset + size;
+      auto const first =
+        std::min(end, offset % block == 0 ? offset : offset - offset % block + block);
+      auto const last = std::max(first, end - end % block);
+      std::vector<write_edge_piece> pieces;
+      if (first > offset) pieces.push_back({offset, first - offset, src});
+      if (end > last) pieces.push_back({last, end - last, src + (last - offset)});
+      range const whole{first, last - first};
+      write_edge_blocks(obj, pieces, std::span{&whole, last > first ? 1U : 0U});
+      if (last > first) host_write_io(obj, first, last - first, src + (first - offset));
+      written = size;
+    } else {
+      if (min_alignment_requirement() > 1) {
+        range const whole{offset, size};
+        forget_overwritten_edge(obj, std::span{&whole, 1});
+      }
+      written = host_write_io(obj, offset, size, src);
+    }
     invalidate_cached(obj.object_path());
     return written;
   } catch (...) {
@@ -376,28 +546,121 @@ exec::semi_future<std::size_t> ioctx::submit_write(const io_object& obj,
 {
   try {
     auto const resolved = resolve_priority(priority, io_priority::high);
+    // A backend that writes with O_DIRECT is handed whole blocks only; the bytes
+    // that share a block with something else go through write_edge_blocks.
+    auto const block = min_alignment_requirement() > 1
+                         ? std::max(min_alignment_requirement(), write_granule())
+                         : std::size_t{1};
+    struct cut {
+      range head, whole, tail;
+    };
+    auto const cut_of = [block](range rng) {
+      auto const end   = rng.end();
+      auto const first = std::min(
+        end, rng.offset % block == 0 ? rng.offset : rng.offset - rng.offset % block + block);
+      auto const last = std::max(first, end - end % block);
+      return cut{
+        range{rng.offset, first - rng.offset}, range{first, last - first}, range{last, end - last}};
+    };
     std::vector<prepared_io_slice> slices;
     slices.reserve(host_slices.size() + device_slices.size());
+    std::vector<write_edge_piece> pieces;
+    std::vector<range> whole_ranges;
+    std::size_t edge_bytes = 0;
     for (auto const& current : host_slices) {
       if (current.size() == 0) continue;
       if (current.src == nullptr) throw std::invalid_argument("host write source is null");
-      slices.push_back(make_host_write_slice(current.rng, current.src, resolved));
+      auto const parts = cut_of(current.rng);
+      for (auto const& part : {parts.head, parts.tail}) {
+        if (part.size == 0) continue;
+        pieces.push_back(
+          {part.offset, part.size, current.src + (part.offset - current.rng.offset)});
+        edge_bytes += part.size;
+      }
+      if (parts.whole.size == 0) continue;
+      whole_ranges.push_back(parts.whole);
+      slices.push_back(make_host_write_slice(
+        parts.whole, current.src + (parts.whole.offset - current.rng.offset), resolved));
     }
     bool const has_device = std::ranges::any_of(
       device_slices, [](write_slice const& current) { return current.size() != 0; });
+    // The partial blocks of device slices are copied to the host first, in stream order.
+    std::vector<std::uint8_t> device_edges;
+    std::vector<std::pair<std::size_t, const std::uint8_t*>> device_copies;  // piece index, source
     for (auto const& current : device_slices) {
       if (current.size() == 0) continue;
       if (current.src == nullptr) throw std::invalid_argument("device write source is null");
+      auto const parts = cut_of(current.rng);
+      for (auto const& part : {parts.head, parts.tail}) {
+        if (part.size == 0) continue;
+        device_copies.emplace_back(pieces.size(), current.src + (part.offset - current.rng.offset));
+        pieces.push_back({part.offset, part.size, nullptr});
+        edge_bytes += part.size;
+      }
+      if (parts.whole.size == 0) continue;
+      whole_ranges.push_back(parts.whole);
       slices.push_back(
-        make_device_write_slice(current.rng, current.src, stream.get(), -1, resolved));
+        make_device_write_slice(parts.whole,
+                                current.src + (parts.whole.offset - current.rng.offset),
+                                stream.get(),
+                                -1,
+                                resolved));
     }
-    if (slices.empty()) return exec::make_semi_future<std::size_t>(0);
+    if (slices.empty() && pieces.empty()) return exec::make_semi_future<std::size_t>(0);
     require_writable(*this, obj, has_device, "write");
+    if (!pieces.empty()) {
+      // The backend validates what it is handed, but the partial blocks are written here, before
+      // it sees anything: check the request as the caller wrote it first (overlaps, ranges).
+      std::vector<prepared_io_slice> original;
+      original.reserve(host_slices.size() + device_slices.size());
+      for (auto const& current : host_slices) {
+        if (current.size() != 0)
+          original.push_back(make_host_write_slice(current.rng, current.src));
+      }
+      for (auto const& current : device_slices) {
+        if (current.size() != 0) {
+          original.push_back(make_device_write_slice(current.rng, current.src, stream.get(), -1));
+        }
+      }
+      std::ignore = validate_write_slices(original);
+    }
+    if (!device_copies.empty()) {
+      std::size_t total = 0;
+      for (auto const& [index, source] : device_copies)
+        total += pieces[index].size;
+      device_edges.resize(total);
+      std::size_t used = 0;
+      for (auto const& [index, source] : device_copies) {
+        CUCASCADE_CUDA_TRY(cudaMemcpyAsync(device_edges.data() + used,
+                                           source,
+                                           pieces[index].size,
+                                           cudaMemcpyDeviceToHost,
+                                           stream.get()));
+        pieces[index].src = device_edges.data() + used;
+        used += pieces[index].size;
+      }
+      CUCASCADE_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+    }
 
     auto const& path = obj.object_path();
     invalidate_cached(path);
     cache::fs_cache::pending_invalidation pending;
     if (_cache) { pending = _cache->invalidate_later(path); }
+    if (pieces.empty() && block > 1) forget_overwritten_edge(obj, whole_ranges);
+    if (!pieces.empty()) {
+      try {
+        write_edge_blocks(obj, pieces, whole_ranges);
+      } catch (...) {
+        pending.fire();
+        _metadata_store.invalidate_written(path);
+        throw;
+      }
+    }
+    if (slices.empty()) {
+      pending.fire();
+      _metadata_store.invalidate_written(path);
+      return exec::make_semi_future<std::size_t>(std::size_t{edge_bytes});
+    }
     // Everything the completion needs is allocated BEFORE the write is
     // dispatched, so nothing can fail between starting physical work and
     // attaching the second invalidation pass.  That pass runs once the write
@@ -415,9 +678,15 @@ exec::semi_future<std::size_t> ioctx::submit_write(const io_object& obj,
       [pending  = std::move(pending),
        metadata = &_metadata_store,
        path     = std::string{path},
-       bridge   = std::move(bridge)](exec::try_t<std::size_t>&& outcome) mutable {
+       edge_bytes,
+       bridge = std::move(bridge)](exec::try_t<std::size_t>&& outcome) mutable {
         pending.fire();
         metadata->invalidate_written(path);
+        // The partial blocks were written before the request was dispatched.
+        if (edge_bytes != 0 && outcome.has_value()) {
+          auto const whole = std::move(outcome).get();
+          outcome.emplace(whole + edge_bytes);
+        }
         bridge.set_try(std::move(outcome));
       }};
 

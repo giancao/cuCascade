@@ -304,8 +304,10 @@ struct write_path {
  * Compare a file's bytes with the expected ones; on a mismatch report where, not
  * the whole (megabytes long) vectors.
  */
-void check_same(std::vector<std::uint8_t> const& got, std::vector<std::uint8_t> const& want)
+void check_same(std::vector<std::uint8_t> const& got, std::vector<std::uint8_t> want)
 {
+  // The front end completes partial blocks with zeros: a file ends on a block boundary.
+  want.resize((want.size() + 4095) / 4096 * 4096, 0);
   CHECK(got.size() == want.size());
   auto const n        = std::min(got.size(), want.size());
   std::size_t first   = n;
@@ -434,7 +436,7 @@ TEST_CASE("cufile host writes round-trip aligned and unaligned ranges", "[io][cu
         shadow.write(offset, bytes);
       }
     }
-    CHECK(object->size() == shadow.bytes().size());
+    CHECK(object->size() == (shadow.bytes().size() + 4095) / 4096 * 4096);
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
     ctx->flush(*object);
     REQUIRE_NOTHROW(ctx->flush_async(*object).get(30s));
@@ -487,7 +489,7 @@ TEST_CASE("cufile host writes from 8 B-aligned blocks land in place", "[io][cufi
       total += sl.size();
     }
     REQUIRE(ctx->host_writev_async(*object, slices).get(60s) == total);
-    CHECK(object->size() == shadow.bytes().size());
+    CHECK(object->size() == (shadow.bytes().size() + 4095) / 4096 * 4096);
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
   }
 }
@@ -524,7 +526,7 @@ TEST_CASE("cufile device writes round-trip on every path", "[io][cufile][write][
               size);
       shadow.write(offset, bytes);
     }
-    CHECK(object->size() == shadow.bytes().size());
+    CHECK(object->size() == (shadow.bytes().size() + 4095) / 4096 * 4096);
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
   }
 }
