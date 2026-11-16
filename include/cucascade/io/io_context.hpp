@@ -615,26 +615,41 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   //
   // Only for a backend that writes with O_DIRECT: @ref write_alignment_requirement
   // is above 1 exactly then. Any other backend gets every write as the caller
-  // made it, as before.
+  // made it.
   //
-  // A backend that writes with O_DIRECT (@ref min_alignment_requirement above 1)
-  // can only write whole blocks that way. It is never handed less: the front
-  // end completes the first and the last block of a write that is not block
-  // aligned and writes them whole, so no part of a file goes through the page
-  // cache while the rest is written directly (mixing the two can leave stale
-  // pages in the page cache).
+  // O_DIRECT writes whole blocks, so such a backend is never handed less: the
+  // front end completes the first and the last block of a request that is not
+  // block aligned and writes them whole, and no part of a file goes through the
+  // page cache while the rest is written directly (mixing the two can leave
+  // stale pages in the page cache). The rules:
   //
-  // The rule for callers: start a file at a block boundary and write it front
-  // to back. The unfinished last block of a write is remembered per object, so
-  // the next write that continues in that block is merged with it in memory.
-  // Any other partial block is completed from the file (a read), or with zeros
-  // past the end of the file. A file written this way ends on a block boundary.
+  //  - A request that starts inside a block must start inside the file's data
+  //    or exactly at its end, so that the bytes in front of it in that block
+  //    are the file's. They are taken from the block this object remembers
+  //    (when the request continues exactly where the object left the file and
+  //    the file still ends there) or read back from the file: a reopened file
+  //    and the middle of a file both work. Bytes in front of a request are
+  //    never invented: a request that starts inside a block past the end of
+  //    the data fails with std::invalid_argument before anything is written.
+  //  - Zeros fill only what lies behind the request's first byte and past the
+  //    end of the file: a gap inside the request and the rest of its last
+  //    block. That padding is cut off again when the request is over
+  //    (io_object::resize), so the size of the file is the size of its data.
+  //  - A file is written through one object at a time. Bytes another writer
+  //    puts into a block this object is completing can be lost, as with any
+  //    O_DIRECT read-modify-write.
+  //
+  // The partial blocks are written on the calling thread before the rest of the
+  // request is dispatched.
 
  public:
   /// The unit a write must start on and cover whole multiples of for the backend
   /// to write it directly. Above 1 only when the backend writes with O_DIRECT;
   /// 1 (the default) means writes have no alignment requirement.
   [[nodiscard]] virtual std::size_t write_alignment_requirement() const noexcept { return 1; }
+
+  /// Per-object state of the unaligned writes (io_context.cpp).
+  struct write_edge_object;
 
  private:
   /// Host bytes of a write that share a block with other bytes.
@@ -645,13 +660,13 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   };
 
   /// Completes and writes the blocks @p pieces fall in, on the calling thread.
-  /// @p whole_ranges are the block-aligned ranges of the same write.
+  /// [@p request_begin, @p request_end) spans the whole request. On return the
+  /// caller owes one finish of the unaligned request (see io_context.cpp).
   void write_edge_blocks(const io_object& obj,
+                         write_edge_object& state,
                          std::vector<write_edge_piece>& pieces,
-                         std::span<const range> whole_ranges);
-
-  /// A whole-block write over the remembered last block makes the remembered copy stale.
-  void forget_overwritten_edge(const io_object& obj, std::span<const range> whole_ranges);
+                         std::size_t request_begin,
+                         std::size_t request_end);
 
   struct write_edge_state;
   std::unique_ptr<write_edge_state> _write_edges;

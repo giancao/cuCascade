@@ -304,13 +304,8 @@ struct write_path {
  * Compare a file's bytes with the expected ones; on a mismatch report where, not
  * the whole (megabytes long) vectors.
  */
-void check_same(std::vector<std::uint8_t> const& got, std::vector<std::uint8_t> want)
+void check_same(std::vector<std::uint8_t> const& got, std::vector<std::uint8_t> const& want)
 {
-  // The front end completes partial blocks with zeros: a file ends on a block boundary.
-  // Only with O_DIRECT: without it the file is exactly what was written.
-  if (auto const padded = (want.size() + 4095) / 4096 * 4096; got.size() == padded) {
-    want.resize(padded, 0);
-  }
   CHECK(got.size() == want.size());
   auto const n        = std::min(got.size(), want.size());
   std::size_t first   = n;
@@ -440,8 +435,7 @@ TEST_CASE("cufile host writes round-trip aligned and unaligned ranges", "[io][cu
       }
     }
     {
-      auto const unit = ctx->write_alignment_requirement();
-      CHECK(object->size() == (shadow.bytes().size() + unit - 1) / unit * unit);
+      CHECK(object->size() == shadow.bytes().size());
     }
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
     ctx->flush(*object);
@@ -496,8 +490,7 @@ TEST_CASE("cufile host writes from 8 B-aligned blocks land in place", "[io][cufi
     }
     REQUIRE(ctx->host_writev_async(*object, slices).get(60s) == total);
     {
-      auto const unit = ctx->write_alignment_requirement();
-      CHECK(object->size() == (shadow.bytes().size() + unit - 1) / unit * unit);
+      CHECK(object->size() == shadow.bytes().size());
     }
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
   }
@@ -527,7 +520,7 @@ TEST_CASE("cufile device writes round-trip on every path", "[io][cufile][write][
     for (auto const& [offset, size, misalignment] : {shape{4096, 8 * MiB, 0},
                                                      shape{123, 3 * MiB + 7, 0},
                                                      shape{12 * MiB, 20 * MiB + 5, 0},
-                                                     shape{40 * MiB + 17, 100, 0},
+                                                     shape{40 * MiB, 100, 0},
                                                      shape{48 * MiB, 2 * MiB, 256}}) {
       auto const bytes = pattern(size, ++seed);
       device_bytes const src{bytes, misalignment};
@@ -536,8 +529,7 @@ TEST_CASE("cufile device writes round-trip on every path", "[io][cufile][write][
       shadow.write(offset, bytes);
     }
     {
-      auto const unit = ctx->write_alignment_requirement();
-      CHECK(object->size() == (shadow.bytes().size() + unit - 1) / unit * unit);
+      CHECK(object->size() == shadow.bytes().size());
     }
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
   }
@@ -670,10 +662,10 @@ TEST_CASE("cufile vectored writes place every segment", "[io][cufile][write][gpu
   auto const h1 = pattern(70'000, 301);
   host_bytes const hs0{h0, 8};
   host_bytes const hs1{h1, 0};
-  std::vector<write_slice> host_slices{{20 * MiB + 100, h0.size(), hs0.get()},
+  std::vector<write_slice> host_slices{{20 * MiB, h0.size(), hs0.get()},
                                        {20 * MiB + 5100, h1.size(), hs1.get()}};
   REQUIRE(ctx->host_writev_async(*object, host_slices).get(30s) == h0.size() + h1.size());
-  shadow.write(20 * MiB + 100, h0);
+  shadow.write(20 * MiB, h0);
   shadow.write(20 * MiB + 5100, h1);
 
   auto const m0 = pattern(3 * MiB, 400);
@@ -681,11 +673,11 @@ TEST_CASE("cufile vectored writes place every segment", "[io][cufile][write][gpu
   device_bytes const ms0{m0};
   host_bytes const ms1{m1, 0};
   std::vector<write_slice> mixed_device{{24 * MiB, m0.size(), ms0.get()}};
-  std::vector<write_slice> mixed_host{{24 * MiB - 6000, m1.size(), ms1.get()}};
+  std::vector<write_slice> mixed_host{{24 * MiB - 8192, m1.size(), ms1.get()}};
   REQUIRE(ctx->mixed_writev_async(*object, mixed_host, mixed_device, stream.ref()).get(60s) ==
           m0.size() + m1.size());
   shadow.write(24 * MiB, m0);
-  shadow.write(24 * MiB - 6000, m1);
+  shadow.write(24 * MiB - 8192, m1);
 
   CHECK(object->size() == shadow.bytes().size());
   check_same(read_back(ctx.get(), path.str()), shadow.bytes());
@@ -752,6 +744,9 @@ TEST_CASE("cufile concurrent writers of disjoint ranges sharing blocks", "[io][c
   force_cufile_writes const force;
   config cfg{};
   cfg.gds_threshold = IO_BLOCK_SIZE;
+  // Writers that start inside blocks they share are not a use of O_DIRECT: such a write is
+  // rejected there, because the bytes in front of it are another writer's.
+  cfg.use_odirect = false;
   write_context ctx{cfg, 4};
   scratch_path path;
   auto object = ctx->open_io_object_for_write(path.str());

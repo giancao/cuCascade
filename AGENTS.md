@@ -156,13 +156,18 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   twice throws.
 - `disk_data_representation` deletes its file on destruction, and its `clone()` always throws;
   materialize to another tier through a converter.
-- A backend that writes with O_DIRECT is never handed a partial block: `ioctx`'s write entry
-  points complete the first and last block of an unaligned write and write them whole
-  (`write_edge_blocks` in `io_context.cpp`). Callers should start a file on a block boundary and
-  write front to back: the unfinished last block is remembered per object and merged with the
-  next write in memory; any other partial block is read back from the file (the slow path). Those
-  blocks are written synchronously on the calling thread, a file ends on a block boundary, and
-  `write_edge_stats()` counts the three cases.
+- A backend that writes with O_DIRECT (`write_alignment_requirement() > 1`, i.e. uring or the cuFile
+  reactor with `use_odirect`) is never handed a partial block: `ioctx`'s write entry points
+  complete the first and last block of an unaligned request and write them whole
+  (`write_edge_blocks` in `io_context.cpp`; the rules are in the comment in `io_context.hpp`).
+  A request that starts inside a block must start inside the file's data or exactly at its end:
+  the bytes in front of it come from the block the object remembers or are read back from the
+  file, never invented, and a start inside a block past the end of the data fails with
+  `std::invalid_argument`. Zeros only pad behind a request's first byte past the end of the
+  file, and that padding is cut off when the request is over (`io_object::resize`), so a file is
+  as long as its data. The per-object state hangs off the object (`io_object::client_state`);
+  block-aligned requests take no lock, unaligned ones take the object's mutex. Without O_DIRECT
+  writes reach the backend unchanged.
 - The DISK converters hand the io context whole blocks only (`disk_block_size()`, 4 KiB): buffers
   start on block boundaries and the partial last block of each is padded with zeros in host
   memory (`disk_edge_blocks`). Do not write a partial block: an io stack using O_DIRECT would
