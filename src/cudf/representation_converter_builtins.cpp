@@ -60,10 +60,12 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -1316,6 +1318,85 @@ static_assert(DISK_FILE_ALIGNMENT % io::IO_BLOCK_SIZE == 0,
               "disk file buffers must start on O_DIRECT / GPUDirect Storage boundaries");
 
 /**
+ * @brief The unit batch files are laid out and written in.
+ *
+ * Every column buffer starts on a multiple of it, and every write slice the converters hand to
+ * the io context covers whole units, so an io stack that writes with O_DIRECT never has a partial
+ * block left over to write through the page cache. It is the io layer's write granule when that
+ * is larger than DISK_FILE_ALIGNMENT (a system with pages larger than 4 KiB).
+ */
+static std::size_t disk_block_size() noexcept
+{
+  static std::size_t const size = std::max<std::size_t>(DISK_FILE_ALIGNMENT, io::write_granule());
+  return size;
+}
+
+/**
+ * @brief The partial blocks of a batch file, each padded with zeros to a whole block.
+ *
+ * A buffer rarely ends on a block boundary, and a buffer held in host blocks is cut wherever a
+ * host block ends. Written as they are, those pieces are shorter than a block: an io stack using
+ * O_DIRECT has to write them through the page cache, next to blocks it writes directly. Mixing the
+ * two on one file can leave stale pages in the page cache (zeros where the disk holds the data),
+ * which a later buffered read returns. So each such block is assembled here instead, in host
+ * memory aligned for O_DIRECT, and written whole like every other block. A buffer owns the blocks
+ * it touches (buffers start on block boundaries), so the padding overwrites nothing.
+ *
+ * Blocks are handed out in file order; the pointers stay valid until this object is destroyed,
+ * which must be after the write request has drained.
+ */
+class disk_edge_blocks {
+ public:
+  disk_edge_blocks() : _block(disk_block_size()) {}
+
+  disk_edge_blocks(disk_edge_blocks const&)            = delete;
+  disk_edge_blocks& operator=(disk_edge_blocks const&) = delete;
+
+  /// The zero-filled block that holds the file range starting at @p file_offset (a block
+  /// boundary). Asking again for the block handed out last returns it, so a block shared by the
+  /// end of one piece and the start of the next is filled by both.
+  [[nodiscard]] std::uint8_t* block_at(std::size_t file_offset)
+  {
+    if (!_offsets.empty() && _offsets.back() == file_offset) { return _last; }
+    if (_used == blocks_per_slab || _slabs.empty()) {
+      auto* memory =
+        static_cast<std::uint8_t*>(std::aligned_alloc(_block, _block * blocks_per_slab));
+      if (memory == nullptr) { throw std::bad_alloc(); }
+      _slabs.emplace_back(memory);
+      std::memset(memory, 0, _block * blocks_per_slab);
+      _used = 0;
+    }
+    _last = _slabs.back().get() + _used * _block;
+    ++_used;
+    _offsets.push_back(file_offset);
+    _blocks.push_back(_last);
+    return _last;
+  }
+
+  /// One whole-block host write slice per block handed out.
+  void append_slices(std::vector<io::write_slice>& slices) const
+  {
+    for (std::size_t i = 0; i < _offsets.size(); ++i) {
+      slices.emplace_back(_offsets[i], _block, _blocks[i]);
+    }
+  }
+
+ private:
+  static constexpr std::size_t blocks_per_slab = 64;
+
+  struct free_deleter {
+    void operator()(std::uint8_t* memory) const noexcept { std::free(memory); }
+  };
+
+  std::size_t _block;
+  std::vector<std::unique_ptr<std::uint8_t, free_deleter>> _slabs;
+  std::size_t _used{0};
+  std::uint8_t* _last{nullptr};
+  std::vector<std::size_t> _offsets;
+  std::vector<std::uint8_t*> _blocks;
+};
+
+/**
  * @brief RAII guard that deletes a file on destruction unless released.
  *
  * Ensures partial files are cleaned up if an exception occurs during writing.
@@ -1336,15 +1417,18 @@ struct disk_file_guard {
 /**
  * @brief Append the write slices that store a host-block range at a file offset.
  *
- * A buffer may span host blocks; it becomes one slice per block it touches.
+ * A buffer may span host blocks; each host block it touches contributes the whole file blocks it
+ * covers as one slice, and what is left at either end goes into @p edges (see disk_edge_blocks).
  */
 static void collect_host_write_slices(
   const memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
   std::size_t alloc_offset,
   std::size_t size,
   std::size_t file_offset,
-  std::vector<io::write_slice>& slices)
+  std::vector<io::write_slice>& slices,
+  disk_edge_blocks& edges)
 {
+  const std::size_t unit       = disk_block_size();
   const std::size_t block_size = alloc.block_size();
   std::size_t block_idx        = alloc_offset / block_size;
   std::size_t block_off        = alloc_offset % block_size;
@@ -1354,9 +1438,18 @@ static void collect_host_write_slices(
     std::size_t avail     = block_size - block_off;
     std::size_t chunk     = std::min(remaining, avail);
     auto block            = alloc.at(block_idx);
-    slices.emplace_back(file_offset + written,
-                        chunk,
-                        reinterpret_cast<std::uint8_t const*>(block.data() + block_off));
+    auto const* src       = reinterpret_cast<std::uint8_t const*>(block.data() + block_off);
+    auto const at         = file_offset + written;
+    std::size_t done      = 0;
+    if (auto const misaligned = at % unit; misaligned != 0) {
+      done = std::min(chunk, unit - misaligned);
+      std::memcpy(edges.block_at(at - misaligned) + misaligned, src, done);
+    }
+    if (auto const whole = (chunk - done) / unit * unit; whole != 0) {
+      slices.emplace_back(at + done, whole, src + done);
+      done += whole;
+    }
+    if (done < chunk) { std::memcpy(edges.block_at(at + done), src + done, chunk - done); }
     written += chunk;
     block_off += chunk;
     if (block_off == block_size) {
@@ -1402,7 +1495,8 @@ static void collect_host_read_slices(
  * @brief Recompute column_metadata offsets for 4KB-aligned disk file layout.
  *
  * Copies all non-offset fields from src, then assigns null_mask_offset and data_offset
- * to 4KB-aligned positions within the file. The cursor is advanced past each buffer.
+ * to block-aligned positions within the file (disk_block_size(), 4KB on most systems). The
+ * cursor is advanced past each buffer.
  */
 static memory::column_metadata recompute_file_offsets(const memory::column_metadata& src,
                                                       std::size_t& cursor)
@@ -1416,7 +1510,7 @@ static memory::column_metadata recompute_file_offsets(const memory::column_metad
   dst.has_null_mask  = src.has_null_mask;
   dst.null_mask_size = src.null_mask_size;
   if (src.has_null_mask && src.null_mask_size > 0) {
-    cursor               = rmm::align_up(cursor, DISK_FILE_ALIGNMENT);
+    cursor               = rmm::align_up(cursor, disk_block_size());
     dst.null_mask_offset = cursor;
     cursor += src.null_mask_size;
   } else {
@@ -1426,7 +1520,7 @@ static memory::column_metadata recompute_file_offsets(const memory::column_metad
   dst.has_data  = src.has_data;
   dst.data_size = src.data_size;
   if (src.has_data && src.data_size > 0) {
-    cursor          = rmm::align_up(cursor, DISK_FILE_ALIGNMENT);
+    cursor          = rmm::align_up(cursor, disk_block_size());
     dst.data_offset = cursor;
     cursor += src.data_size;
   } else {
@@ -1447,21 +1541,23 @@ static void collect_column_write_slices(
   const memory::column_metadata& src_meta,
   const memory::column_metadata& disk_meta,
   const memory::fixed_size_host_memory_resource::multiple_blocks_allocation& alloc,
-  std::vector<io::write_slice>& slices)
+  std::vector<io::write_slice>& slices,
+  disk_edge_blocks& edges)
 {
   if (src_meta.has_null_mask && src_meta.null_mask_size > 0) {
     collect_host_write_slices(alloc,
                               src_meta.null_mask_offset,
                               src_meta.null_mask_size,
                               disk_meta.null_mask_offset,
-                              slices);
+                              slices,
+                              edges);
   }
   if (src_meta.has_data && src_meta.data_size > 0) {
     collect_host_write_slices(
-      alloc, src_meta.data_offset, src_meta.data_size, disk_meta.data_offset, slices);
+      alloc, src_meta.data_offset, src_meta.data_size, disk_meta.data_offset, slices, edges);
   }
   for (std::size_t i = 0; i < src_meta.children.size(); ++i) {
-    collect_column_write_slices(src_meta.children[i], disk_meta.children[i], alloc, slices);
+    collect_column_write_slices(src_meta.children[i], disk_meta.children[i], alloc, slices, edges);
   }
 }
 
@@ -1562,14 +1658,18 @@ static std::unique_ptr<idata_representation> convert_host_data_to_disk(
   for (const auto& col : host_table->columns) {
     disk_columns.push_back(recompute_file_offsets(col, cursor));
   }
-  std::size_t total_file_data_size = cursor;
+  // The file is written in whole blocks, so its size is the layout's end rounded up to one.
+  std::size_t total_file_data_size = rmm::align_up(cursor, disk_block_size());
 
-  // Write all column buffers with one request
+  // Write all column buffers with one request, in whole blocks: the partial blocks at the ends
+  // of the buffers and of the host blocks are assembled in `edges`, which outlives the request.
+  disk_edge_blocks edges;
   std::vector<io::write_slice> slices;
   for (std::size_t i = 0; i < host_table->columns.size(); ++i) {
     collect_column_write_slices(
-      host_table->columns[i], disk_columns[i], *host_table->allocation, slices);
+      host_table->columns[i], disk_columns[i], *host_table->allocation, slices, edges);
   }
+  edges.append_slices(slices);
   detail::write_disk_file_host(*io_context, file_path, slices, total_file_data_size);
 
   guard.release();
@@ -1651,29 +1751,61 @@ static void require_stream_on_device(::cuda::stream_ref stream, int source_devic
  *
  * All (device pointer, size, file offset) triples of the table go into one device write request.
  */
+/// A device buffer's last partial block: copied to @c dst (in a disk_edge_blocks block) before
+/// the write is submitted.
+struct gpu_tail_copy {
+  std::uint8_t* dst;
+  std::uint8_t const* src;
+  std::size_t size;
+};
+
+/// The whole blocks of one device buffer go to @p slices; what is left of its last block is
+/// queued in @p tails for a copy into @p edges (see disk_edge_blocks).
+static void collect_gpu_buffer_write(std::size_t file_offset,
+                                     std::size_t size,
+                                     std::uint8_t const* device,
+                                     std::vector<io::write_slice>& slices,
+                                     disk_edge_blocks& edges,
+                                     std::vector<gpu_tail_copy>& tails)
+{
+  auto const unit  = disk_block_size();
+  auto const whole = size / unit * unit;
+  if (whole != 0) { slices.emplace_back(file_offset, whole, device); }
+  if (whole != size) {
+    tails.push_back({edges.block_at(file_offset + whole), device + whole, size - whole});
+  }
+}
+
 static void collect_gpu_column_write_slices(const cudf::column_view& col,
                                             const memory::column_metadata& disk_meta,
-                                            std::vector<io::write_slice>& slices)
+                                            std::vector<io::write_slice>& slices,
+                                            disk_edge_blocks& edges,
+                                            std::vector<gpu_tail_copy>& tails)
 {
   if (disk_meta.has_null_mask && disk_meta.null_mask_size > 0) {
-    slices.emplace_back(disk_meta.null_mask_offset,
-                        disk_meta.null_mask_size,
-                        reinterpret_cast<std::uint8_t const*>(col.null_mask()));
+    collect_gpu_buffer_write(disk_meta.null_mask_offset,
+                             disk_meta.null_mask_size,
+                             reinterpret_cast<std::uint8_t const*>(col.null_mask()),
+                             slices,
+                             edges,
+                             tails);
   }
   if (disk_meta.has_data && disk_meta.data_size > 0) {
-    slices.emplace_back(disk_meta.data_offset, disk_meta.data_size, col.data<uint8_t>());
+    collect_gpu_buffer_write(
+      disk_meta.data_offset, disk_meta.data_size, col.data<uint8_t>(), slices, edges, tails);
   }
   for (cudf::size_type i = 0; i < col.num_children(); ++i) {
     collect_gpu_column_write_slices(
-      col.child(i), disk_meta.children[static_cast<std::size_t>(i)], slices);
+      col.child(i), disk_meta.children[static_cast<std::size_t>(i)], slices, edges, tails);
   }
 }
 
 /**
  * @brief Convert gpu_table_representation to disk_data_representation.
  *
- * Writes every GPU column buffer straight from device memory with one device write request.
- * File contains only 4KB-aligned column data — metadata stays in memory.
+ * Writes every GPU column buffer with one write request: its whole blocks straight from device
+ * memory, the rest of its last block from a zero-padded host copy (see disk_edge_blocks).
+ * File contains only block-aligned column data — metadata stays in memory.
  * @p stream must belong to the source table's device; a null handle names that device's
  * default stream.
  */
@@ -1716,15 +1848,31 @@ static std::unique_ptr<idata_representation> convert_gpu_to_disk(
   for (const auto& col : planned_columns) {
     disk_columns.push_back(recompute_file_offsets(col, cursor));
   }
-  std::size_t total_file_data_size = cursor;
+  // The file is written in whole blocks, so its size is the layout's end rounded up to one.
+  std::size_t total_file_data_size = rmm::align_up(cursor, disk_block_size());
 
   // Collect every column buffer, then write them all with one request.
-  std::vector<io::write_slice> slices;
+  disk_edge_blocks edges;
+  std::vector<io::write_slice> device_slices;
+  std::vector<gpu_tail_copy> tails;
   for (cudf::size_type i = 0; i < tv.num_columns(); ++i) {
     collect_gpu_column_write_slices(
-      tv.column(i), disk_columns[static_cast<std::size_t>(i)], slices);
+      tv.column(i), disk_columns[static_cast<std::size_t>(i)], device_slices, edges, tails);
   }
-  detail::write_disk_file_device(*io_context, file_path, slices, stream, total_file_data_size);
+  // The partial last blocks are written from host memory, so they are copied off the device
+  // first, in stream order like the write itself, and must have arrived before the request is
+  // submitted: the io context reads host sources whenever it gets to them.
+  if (!tails.empty()) {
+    for (auto const& tail : tails) {
+      CUCASCADE_CUDA_TRY(
+        cudaMemcpyAsync(tail.dst, tail.src, tail.size, cudaMemcpyDeviceToHost, stream.get()));
+    }
+    stream.sync();
+  }
+  std::vector<io::write_slice> host_slices;
+  edges.append_slices(host_slices);
+  detail::write_disk_file_device(
+    *io_context, file_path, host_slices, device_slices, stream, total_file_data_size);
 
   guard.release();
 

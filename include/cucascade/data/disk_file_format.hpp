@@ -22,7 +22,9 @@
 namespace cucascade {
 
 /// @brief Alignment boundary for column data buffers in disk files.
-/// 4KB alignment ensures direct DMA without bounce buffers.
+/// 4KB alignment ensures direct DMA without bounce buffers. Buffers are also written in whole
+/// blocks of this size (the last block of a buffer is zero padded), so a batch file's size is a
+/// multiple of it.
 static constexpr std::size_t DISK_FILE_ALIGNMENT = 4096u;
 
 }  // namespace cucascade
