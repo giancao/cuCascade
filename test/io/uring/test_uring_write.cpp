@@ -1308,6 +1308,109 @@ TEST_CASE("uring write throughput probe", "[.][io][uring][write_bench]")
   std::ignore = cudaFree(device);
 }
 
+TEST_CASE("uring packed write probe", "[.][io][uring][write_bench]")
+{
+  // Hidden: what the front end's block assembly costs. One request writes a host header and
+  // CUCASCADE_WRITE_BENCH_BUFFERS (default 64) device buffers of CUCASCADE_WRITE_BENCH_BUFFER_KIB
+  // KiB (default 16384) in three layouts:
+  //   whole    buffers are whole blocks on block boundaries: nothing to assemble
+  //   aligned  buffers start on block boundaries and end 1234 bytes into a block: the last
+  //            block of each is completed with zeros
+  //   packed   the same buffers one after the other, as a compressed spill writes them: every
+  //            boundary has a block that takes its bytes from two slices
+  // Prints GB/s per round; the layouts alternate within a round. With
+  // CUCASCADE_WRITE_BENCH_PRESIZE=1 the whole layout is also written into a file that already
+  // has its final size, so that no write extends the file ("sized").
+  auto const* dir_env    = std::getenv("CUCASCADE_WRITE_BENCH_DIR");
+  auto const* count_env  = std::getenv("CUCASCADE_WRITE_BENCH_BUFFERS");
+  auto const* size_env   = std::getenv("CUCASCADE_WRITE_BENCH_BUFFER_KIB");
+  auto const* rounds_env = std::getenv("CUCASCADE_WRITE_BENCH_ROUNDS");
+  std::filesystem::path const dir =
+    dir_env != nullptr ? std::filesystem::path{dir_env} : std::filesystem::temp_directory_path();
+  std::size_t const buffers          = count_env != nullptr ? std::stoul(count_env) : 64;
+  std::size_t const whole            = (size_env != nullptr ? std::stoul(size_env) : 16384) * 1024;
+  std::size_t const rounds           = rounds_env != nullptr ? std::stoul(rounds_env) : 5;
+  std::size_t const ragged           = whole + 1234;
+  constexpr std::size_t header_bytes = 2980;
+
+  write_context ctx{4};
+  cuda_stream stream;
+  void* device = nullptr;
+  REQUIRE(cudaMalloc(&device, ragged) == cudaSuccess);
+  REQUIRE(cudaMemset(device, 0x5A, ragged) == cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  std::vector<std::uint8_t> const header(4096, 0x5B);
+  auto const align_up = [](std::size_t value) { return (value + 4095) / 4096 * 4096; };
+
+  bool const presize = std::getenv("CUCASCADE_WRITE_BENCH_PRESIZE") != nullptr;
+  enum class layout { whole, aligned, packed, sized };
+  auto run = [&](layout requested) {
+    auto const path =
+      (dir / ("cucascade_packed_bench_" + std::to_string(::getpid()) + ".bin")).string();
+    auto const how = requested == layout::sized ? layout::whole : requested;
+    if (requested == layout::sized) {
+      {
+        std::ofstream create(path, std::ios::binary);
+      }
+      std::filesystem::resize_file(path, 4096 + buffers * whole);
+    }
+    // Like the spill writers, tell the backend how large the file will be (a preallocation
+    // hint; CUCASCADE_WRITE_BENCH_NO_HINT=1 leaves it out).
+    auto const hint           = std::getenv("CUCASCADE_WRITE_BENCH_NO_HINT") != nullptr
+                                  ? std::size_t{0}
+                                  : 4096 + buffers * align_up(ragged);
+    auto object               = requested == layout::sized
+                                  ? ctx->open_io_object_for_write(path, {.mode = write_mode::open_existing})
+                                  : ctx->open_io_object_for_write(path, {.size_hint = hint});
+    auto const header_written = how == layout::whole ? std::size_t{4096} : header_bytes;
+    auto const buffer_bytes   = how == layout::whole ? whole : ragged;
+    std::vector<write_slice> host_slices{{0, header_written, header.data()}};
+    std::vector<write_slice> device_slices;
+    std::size_t at = how == layout::packed ? header_written : align_up(header_written);
+    for (std::size_t i = 0; i < buffers; ++i) {
+      device_slices.emplace_back(at, buffer_bytes, static_cast<std::uint8_t const*>(device));
+      at = how == layout::packed ? at + buffer_bytes : align_up(at + buffer_bytes);
+    }
+    auto const total  = header_written + buffers * buffer_bytes;
+    auto const before = ctx->write_edge_stats();
+    auto const start  = std::chrono::steady_clock::now();
+    auto const written =
+      ctx->mixed_writev_async(*object, host_slices, device_slices, stream.ref()).get();
+    auto const seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    CHECK(written == total);
+    auto const gathered = ctx->write_edge_stats().gathered_blocks - before.gathered_blocks;
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return std::pair{static_cast<double>(total) / seconds / 1e9, gathered};
+  };
+  std::ignore = run(layout::whole);  // warm up: staging, streams, the first file
+  for (std::size_t round = 0; round < rounds; ++round) {
+    auto const [whole_rate, whole_blocks]     = run(layout::whole);
+    auto const [aligned_rate, aligned_blocks] = run(layout::aligned);
+    auto const [packed_rate, packed_blocks]   = run(layout::packed);
+    if (presize) {
+      std::printf("round %zu: sized %6.3f GB/s (whole blocks into a file of its final size)\n",
+                  round,
+                  run(layout::sized).first);
+    }
+    std::printf(
+      "round %zu: whole %6.3f (%lu)  aligned %6.3f (%lu)  packed %6.3f (%lu)  GB/s "
+      "(blocks assembled)  [%zu buffers of %zu KiB to %s]\n",
+      round,
+      whole_rate,
+      static_cast<unsigned long>(whole_blocks),
+      aligned_rate,
+      static_cast<unsigned long>(aligned_blocks),
+      packed_rate,
+      static_cast<unsigned long>(packed_blocks),
+      buffers,
+      whole / 1024,
+      dir.c_str());
+  }
+  std::ignore = cudaFree(device);
+}
+
 TEST_CASE("uring a request stalled on its caller's stream does not hold up other requests",
           "[io][uring][write]")
 {
