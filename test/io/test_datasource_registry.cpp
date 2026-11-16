@@ -319,6 +319,21 @@ TEST_CASE("io_backend round-trips through its config spelling", "[io][registry][
   CHECK(parsed == io_backend::cufile);
 }
 
+// The cuFile reactors' own scratch is the one page-locked allocation outside the HOST budget;
+// the config says how large it is so a host can account for it.
+TEST_CASE("io_config reports the page-locked memory a backend allocates for itself",
+          "[io][registry][config]")
+{
+  CHECK(config_for(io_backend::native).fixed_pinned_overhead_bytes() == 0);
+  CHECK(config_for(io_backend::cufile_posix).fixed_pinned_overhead_bytes() == 0);
+#ifdef CUCASCADE_HAS_CUFILE
+  auto config = config_for(io_backend::cufile);
+  CHECK(config.fixed_pinned_overhead_bytes() == config.cufile_n_reactors * (std::size_t{16} << 20));
+  config.cufile_n_reactors = 1;
+  CHECK(config.fixed_pinned_overhead_bytes() == std::size_t{16} << 20);
+#endif
+}
+
 TEST_CASE("the registry names the backend that serves local files", "[io][registry][config]")
 {
   CHECK(registry_fixture{}.registry.local_type() == io_context_type::uring);

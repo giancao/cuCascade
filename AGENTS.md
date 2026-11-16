@@ -80,6 +80,9 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   nested namespace there whose name kvikIO also uses (`detail`, `s3`): it would hide kvikIO's.
   The io test binary force-includes `forward.hpp` because the tests of the REST layers include
   kvikIO's private headers (`"io/rest/..."`, `"io/tls/..."`, found through the plugin target).
+- Engines stage only through the injected staging source (the HOST space), except the cuFile
+  reactors: each owns a fixed 16 MiB page-locked scratch. That is a fixed overhead outside the HOST
+  budget, reported by `io_config::fixed_pinned_overhead_bytes()` for hosts that account for it.
 - A staging source reports exhaustion in its own type: `host_staging_source` makes it an
   `rmm::out_of_memory`, which hosts retry on.
 - Running a kvikIO gtest from a standalone kvikIO build needs

@@ -154,6 +154,25 @@ struct io_config {
     cache.apply_mode();
     uring.use_odirect = cache.use_odirect();
   }
+
+  /**
+   * @brief Page-locked memory the configured local backend allocates for itself, at most.
+   *
+   * Every engine stages through the HOST memory space, which accounts for it,
+   * with one exception: the cuFile reactors each own a fixed scratch for their
+   * device fallback (see @c cufile::config::pinned_scratch_bytes). It is a fixed
+   * overhead, outside the HOST budget; a host that accounts for all of its
+   * page-locked memory adds this. Zero for the other backends.
+   */
+  [[nodiscard]] std::size_t fixed_pinned_overhead_bytes() const noexcept
+  {
+#ifdef CUCASCADE_HAS_CUFILE
+    if (backend == io_backend::cufile) {
+      return cufile::config::pinned_scratch_bytes(cufile_n_reactors);
+    }
+#endif
+    return 0;
+  }
 };
 
 }  // namespace cucascade::io
