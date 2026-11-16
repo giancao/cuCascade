@@ -23,17 +23,27 @@
 #include "rest_contract_test_utils.hpp"
 
 #include <cucascade/io/engine_ioctx.hpp>
+#include <cucascade/io/host_staging_source.hpp>
 #include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/object_listing.hpp>
 #include <cucascade/io/rest/rest_ioctx.hpp>
 #include <cucascade/io/uring/uring_ioctx.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 
 #include <kvikio/io/engine_registry.hpp>
 
+#include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime_api.h>
+
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -119,4 +129,98 @@ TEST_CASE("the curl engine serves a REST context: open, read and list", "[rest][
   context.reset();
   CHECK(
     kvikio::io::engine_registry::instance().selected_name(kvikio::io::engine_route::s3).empty());
+}
+
+// The contracts every engine keeps, checked for the curl engine through the REST context that
+// cuCascade builds on it: a future that resolved means the bytes are in the destination, device
+// memory included, and a read that failed leaves the destination alone.
+TEST_CASE("the curl engine keeps the read contracts through a REST context", "[rest][curl]")
+{
+  using cucascade::test::range_fault_policy;
+  using cucascade::test::require_rest_bytes_equal;
+  using cucascade::test::rest_device_bytes;
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    SKIP("requires a CUDA device");
+  }
+  constexpr std::size_t block_size = 1UL << 20;
+  constexpr std::size_t capacity   = 8 * block_size;
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource mr{
+    0, upstream, capacity, capacity, block_size, 4, 1};
+  auto const staging = std::make_shared<cucascade::io::host_staging_source>(mr);
+  auto const payload = cucascade::test::rest_test_payload(3 * block_size + 777);
+
+  SECTION("ranges are read into host memory")
+  {
+    loopback_range_server server{payload};
+    auto context = cucascade::io::rest::make_curl_rest_ioctx(store_for(server), staging);
+    auto object  = context->open_io_object("s3://bucket/object.bin", payload.size());
+    std::vector<std::pair<std::size_t, std::size_t>> const ranges{
+      {17, 257}, {64 * 1024 + 9, 1024}, {2 * block_size + 11, 4096}, {payload.size() - 333, 333}};
+    std::vector<std::vector<std::uint8_t>> buffers;
+    std::vector<cucascade::io::slice> segments;
+    std::size_t total = 0;
+    for (auto const& [offset, size] : ranges) {
+      buffers.emplace_back(size);
+      total += size;
+    }
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+      segments.emplace_back(ranges[i].first, ranges[i].second, buffers[i].data());
+    }
+    REQUIRE(context->host_readv_async_io(*object, segments).get(30s) == total);
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+      require_rest_bytes_equal(buffers[i], {payload.data() + ranges[i].first, ranges[i].second});
+    }
+  }
+
+  SECTION("device memory holds the bytes when the future resolves")
+  {
+    loopback_range_server server{payload};
+    auto context = cucascade::io::rest::make_curl_rest_ioctx(store_for(server), staging);
+    auto object  = context->open_io_object("s3://bucket/object.bin", payload.size());
+    rmm::cuda_stream stream;
+    rmm::device_buffer destination(payload.size(), stream);
+    auto read = context->device_read_async_io(*object,
+                                              0,
+                                              payload.size(),
+                                              static_cast<std::uint8_t*>(destination.data()),
+                                              ::cuda::stream_ref{stream.value()});
+    REQUIRE(std::move(read).get(30s) == payload.size());
+    // Read back on another stream, without synchronizing the one the read used: the copies
+    // must already have happened.
+    rmm::cuda_stream other;
+    require_rest_bytes_equal(rest_device_bytes(destination.data(), payload.size(), other.value()),
+                             payload);
+    // Every staging block went back to the HOST resource.
+    CHECK(mr.get_free_blocks() == mr.get_total_blocks());
+  }
+
+  SECTION("a failed read fails the future and leaves the destinations alone")
+  {
+    range_fault_policy fault{};
+    fault.fail_all_gets = true;
+    fault.fail_status   = 404;
+    loopback_range_server server{payload, fault};
+    auto context = cucascade::io::rest::make_curl_rest_ioctx(store_for(server), staging);
+    auto object  = context->open_io_object("s3://bucket/object.bin", payload.size());
+
+    std::vector<std::uint8_t> host(64 * 1024, 0xEE);
+    auto host_read = context->host_read_async_io(*object, 0, host.size(), host.data());
+    CHECK_THROWS(std::move(host_read).get(30s));
+    CHECK(std::all_of(host.begin(), host.end(), [](std::uint8_t b) { return b == 0xEE; }));
+
+    rmm::cuda_stream stream;
+    rmm::device_buffer destination(host.size(), stream);
+    REQUIRE(cudaMemsetAsync(destination.data(), 0xEE, host.size(), stream.value()) == cudaSuccess);
+    auto device_read = context->device_read_async_io(*object,
+                                                     0,
+                                                     host.size(),
+                                                     static_cast<std::uint8_t*>(destination.data()),
+                                                     ::cuda::stream_ref{stream.value()});
+    CHECK_THROWS(std::move(device_read).get(30s));
+    auto const after = rest_device_bytes(destination.data(), host.size(), stream.value());
+    CHECK(std::all_of(after.begin(), after.end(), [](std::uint8_t b) { return b == 0xEE; }));
+    CHECK(mr.get_free_blocks() == mr.get_total_blocks());
+  }
 }
