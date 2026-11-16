@@ -16,6 +16,8 @@
  * limitations under the License.
  */
 
+#include "utils/page_cache_check.hpp"
+
 #include <cucascade/io/cufile/config.hpp>
 #include <cucascade/io/cufile/cufile_api.hpp>
 #include <cucascade/io/cufile/cufile_ioctx.hpp>
@@ -470,6 +472,7 @@ TEST_CASE("cufile host writes round-trip aligned and unaligned ranges", "[io][cu
     {
       CHECK(object->size() == stored(ctx->write_alignment_requirement(), shadow.bytes()).size());
     }
+    cucascade::test::check_page_cache_matches_disk(path.str());
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
     ctx->flush(*object);
     REQUIRE_NOTHROW(ctx->flush_async(*object).get(30s));
@@ -525,6 +528,7 @@ TEST_CASE("cufile host writes from 8 B-aligned blocks land in place", "[io][cufi
     {
       CHECK(object->size() == stored(ctx->write_alignment_requirement(), shadow.bytes()).size());
     }
+    cucascade::test::check_page_cache_matches_disk(path.str());
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
   }
 }
@@ -571,6 +575,7 @@ TEST_CASE("cufile device writes round-trip on every path", "[io][cufile][write][
     {
       CHECK(object->size() == stored(ctx->write_alignment_requirement(), shadow.bytes()).size());
     }
+    cucascade::test::check_page_cache_matches_disk(path.str());
     check_same(read_back(ctx.get(), path.str()), shadow.bytes());
   }
 }

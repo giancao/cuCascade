@@ -17,6 +17,7 @@
 
 #include "io/detail/local_descriptor.hpp"
 #include "utils/child_test_runner.hpp"
+#include "utils/page_cache_check.hpp"
 
 #include <cucascade/io/io_context.hpp>
 #include <cucascade/io/io_errors.hpp>
@@ -141,7 +142,6 @@ class scratch_path {
   std::filesystem::path _path;
 };
 
-/** The expected file contents: writes applied to a byte vector. */
 /// What a backend writing with O_DIRECT stores for bytes whose last block is partial: the block
 /// is completed with zeros, so the file ends on a block boundary.
 [[nodiscard]] std::vector<std::uint8_t> block_padded(std::vector<std::uint8_t> bytes)
@@ -150,6 +150,7 @@ class scratch_path {
   return bytes;
 }
 
+/** The expected file contents: writes applied to a byte vector. */
 class shadow_file {
  public:
   void write(std::size_t offset, std::span<std::uint8_t const> bytes)
@@ -627,7 +628,6 @@ TEST_CASE("uring host_write round-trips aligned and unaligned ranges", "[io][uri
         auto const bytes = pattern(size, ++seed);
         host_bytes source{bytes, misalignment};
         // Spread the writes so they land on fresh ranges and on earlier ones.
-        // Spread the writes so they land on fresh ranges and on earlier ones.
         auto const at = offset + (seed % 5) * 2 * MiB;
         // With O_DIRECT a write starts on a block boundary, and may end inside a block only
         // when none of the file's data lies behind it; anything else is rejected, untouched.
@@ -644,6 +644,7 @@ TEST_CASE("uring host_write round-trips aligned and unaligned ranges", "[io][uri
       }
     }
   }
+  cucascade::test::check_page_cache_matches_disk(path.str());
   auto const expected = shadow.bytes();
   CHECK((path.contents() == expected));
   CHECK((read_back(ctx.get(), path.str()) == expected));
@@ -696,6 +697,8 @@ TEST_CASE("uring a request of unaligned slices is written as whole blocks",
   auto const expected = block_padded(shadow.bytes());
   CHECK(object->size() == expected.size());
   CHECK(std::filesystem::file_size(path.str()) == expected.size());
+  // No page of the file is left in the page cache with other bytes than the disk has.
+  cucascade::test::check_page_cache_matches_disk(path.str());
   CHECK((path.contents() == expected));                   // through the page cache
   CHECK((read_back(ctx.get(), path.str()) == expected));  // through the backend
 }
@@ -771,6 +774,7 @@ TEST_CASE("uring asynchronous host and device writes round-trip", "[io][uring][w
       CHECK(object->size() == shadow.bytes().size());
     }
   }
+  cucascade::test::check_page_cache_matches_disk(path.str());
   auto const expected = shadow.bytes();
   // Compared as a flag: on a mismatch Catch2 would print both multi-megabyte vectors.
   CHECK((read_back(ctx.get(), path.str()) == expected));
@@ -1305,6 +1309,109 @@ TEST_CASE("uring write throughput probe", "[.][io][uring][write_bench]")
   run("pinned host+8B -> file", false, 8);
 
   std::ignore = cudaFreeHost(pinned);
+  std::ignore = cudaFree(device);
+}
+
+TEST_CASE("uring packed write probe", "[.][io][uring][write_bench]")
+{
+  // Hidden: what the front end's block assembly costs. One request writes a host header and
+  // CUCASCADE_WRITE_BENCH_BUFFERS (default 64) device buffers of CUCASCADE_WRITE_BENCH_BUFFER_KIB
+  // KiB (default 16384) in three layouts:
+  //   whole    buffers are whole blocks on block boundaries: nothing to assemble
+  //   aligned  buffers start on block boundaries and end 1234 bytes into a block: the last
+  //            block of each is completed with zeros
+  //   packed   the same buffers one after the other, as a compressed spill writes them: every
+  //            boundary has a block that takes its bytes from two slices
+  // Prints GB/s per round; the layouts alternate within a round. With
+  // CUCASCADE_WRITE_BENCH_PRESIZE=1 the whole layout is also written into a file that already
+  // has its final size, so that no write extends the file ("sized").
+  auto const* dir_env    = std::getenv("CUCASCADE_WRITE_BENCH_DIR");
+  auto const* count_env  = std::getenv("CUCASCADE_WRITE_BENCH_BUFFERS");
+  auto const* size_env   = std::getenv("CUCASCADE_WRITE_BENCH_BUFFER_KIB");
+  auto const* rounds_env = std::getenv("CUCASCADE_WRITE_BENCH_ROUNDS");
+  std::filesystem::path const dir =
+    dir_env != nullptr ? std::filesystem::path{dir_env} : std::filesystem::temp_directory_path();
+  std::size_t const buffers          = count_env != nullptr ? std::stoul(count_env) : 64;
+  std::size_t const whole            = (size_env != nullptr ? std::stoul(size_env) : 16384) * 1024;
+  std::size_t const rounds           = rounds_env != nullptr ? std::stoul(rounds_env) : 5;
+  std::size_t const ragged           = whole + 1234;
+  constexpr std::size_t header_bytes = 2980;
+
+  write_context ctx{4};
+  cuda_stream stream;
+  void* device = nullptr;
+  REQUIRE(cudaMalloc(&device, ragged) == cudaSuccess);
+  REQUIRE(cudaMemset(device, 0x5A, ragged) == cudaSuccess);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+  std::vector<std::uint8_t> const header(4096, 0x5B);
+  auto const align_up = [](std::size_t value) { return (value + 4095) / 4096 * 4096; };
+
+  bool const presize = std::getenv("CUCASCADE_WRITE_BENCH_PRESIZE") != nullptr;
+  enum class layout { whole, aligned, packed, sized };
+  auto run = [&](layout requested) {
+    auto const path =
+      (dir / ("cucascade_packed_bench_" + std::to_string(::getpid()) + ".bin")).string();
+    auto const how = requested == layout::sized ? layout::whole : requested;
+    if (requested == layout::sized) {
+      {
+        std::ofstream create(path, std::ios::binary);
+      }
+      std::filesystem::resize_file(path, 4096 + buffers * whole);
+    }
+    // Like the spill writers, tell the backend how large the file will be (a preallocation
+    // hint; CUCASCADE_WRITE_BENCH_NO_HINT=1 leaves it out).
+    auto const hint           = std::getenv("CUCASCADE_WRITE_BENCH_NO_HINT") != nullptr
+                                  ? std::size_t{0}
+                                  : 4096 + buffers * align_up(ragged);
+    auto object               = requested == layout::sized
+                                  ? ctx->open_io_object_for_write(path, {.mode = write_mode::open_existing})
+                                  : ctx->open_io_object_for_write(path, {.size_hint = hint});
+    auto const header_written = how == layout::whole ? std::size_t{4096} : header_bytes;
+    auto const buffer_bytes   = how == layout::whole ? whole : ragged;
+    std::vector<write_slice> host_slices{{0, header_written, header.data()}};
+    std::vector<write_slice> device_slices;
+    std::size_t at = how == layout::packed ? header_written : align_up(header_written);
+    for (std::size_t i = 0; i < buffers; ++i) {
+      device_slices.emplace_back(at, buffer_bytes, static_cast<std::uint8_t const*>(device));
+      at = how == layout::packed ? at + buffer_bytes : align_up(at + buffer_bytes);
+    }
+    auto const total  = header_written + buffers * buffer_bytes;
+    auto const before = ctx->write_edge_stats();
+    auto const start  = std::chrono::steady_clock::now();
+    auto const written =
+      ctx->mixed_writev_async(*object, host_slices, device_slices, stream.ref()).get();
+    auto const seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    CHECK(written == total);
+    auto const gathered = ctx->write_edge_stats().gathered_blocks - before.gathered_blocks;
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return std::pair{static_cast<double>(total) / seconds / 1e9, gathered};
+  };
+  std::ignore = run(layout::whole);  // warm up: staging, streams, the first file
+  for (std::size_t round = 0; round < rounds; ++round) {
+    auto const [whole_rate, whole_blocks]     = run(layout::whole);
+    auto const [aligned_rate, aligned_blocks] = run(layout::aligned);
+    auto const [packed_rate, packed_blocks]   = run(layout::packed);
+    if (presize) {
+      std::printf("round %zu: sized %6.3f GB/s (whole blocks into a file of its final size)\n",
+                  round,
+                  run(layout::sized).first);
+    }
+    std::printf(
+      "round %zu: whole %6.3f (%lu)  aligned %6.3f (%lu)  packed %6.3f (%lu)  GB/s "
+      "(blocks assembled)  [%zu buffers of %zu KiB to %s]\n",
+      round,
+      whole_rate,
+      static_cast<unsigned long>(whole_blocks),
+      aligned_rate,
+      static_cast<unsigned long>(aligned_blocks),
+      packed_rate,
+      static_cast<unsigned long>(packed_blocks),
+      buffers,
+      whole / 1024,
+      dir.c_str());
+  }
   std::ignore = cudaFree(device);
 }
 

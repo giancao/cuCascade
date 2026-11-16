@@ -193,6 +193,10 @@ Tooling and environments come from pixi (`pixi.toml`); lint tool versions are pi
   (`test/utils/child_test_runner.hpp`).
 - Tests must fail rather than hang: bound every wait with a timeout and release latches on all
   exit paths, including exceptions.
+- A test that writes a file through an io context ends with
+  `test::check_page_cache_matches_disk(path)` (`test/utils/page_cache_check.hpp`): every block is
+  read through the page cache and with O_DIRECT, and the two must agree. The write tests of the
+  uring and cuFile contexts and the randomized DISK round trip (all four backends) do.
 
 ## Conventions not enforced by tooling
 
