@@ -142,6 +142,14 @@ class scratch_path {
 };
 
 /** The expected file contents: writes applied to a byte vector. */
+/// What a backend writing with O_DIRECT stores for bytes whose last block is partial: the block
+/// is completed with zeros, so the file ends on a block boundary.
+[[nodiscard]] std::vector<std::uint8_t> block_padded(std::vector<std::uint8_t> bytes)
+{
+  bytes.resize((bytes.size() + 4095) / 4096 * 4096, 0);
+  return bytes;
+}
+
 class shadow_file {
  public:
   void write(std::size_t offset, std::span<std::uint8_t const> bytes)
@@ -619,14 +627,19 @@ TEST_CASE("uring host_write round-trips aligned and unaligned ranges", "[io][uri
         auto const bytes = pattern(size, ++seed);
         host_bytes source{bytes, misalignment};
         // Spread the writes so they land on fresh ranges and on earlier ones.
-        // With O_DIRECT a write starts on a block boundary (or continues the file, which the
-        // alignment test covers); the sizes stay ragged.
-        auto const at = (use_odirect ? offset / 4096 * 4096 : offset) + (seed % 5) * 2 * MiB;
+        // Spread the writes so they land on fresh ranges and on earlier ones.
+        auto const at = offset + (seed % 5) * 2 * MiB;
+        // With O_DIRECT a write starts on a block boundary, and may end inside a block only
+        // when none of the file's data lies behind it; anything else is rejected, untouched.
+        bool const allowed =
+          !use_odirect || (at % 4096 == 0 && (size % 4096 == 0 || at + size >= object->size()));
+        if (!allowed) {
+          CHECK_THROWS_AS(ctx->host_write(*object, at, size, source.get()), std::invalid_argument);
+          CHECK(object->size() == shadow.bytes().size());
+          continue;
+        }
         CHECK(ctx->host_write(*object, at, size, source.get()) == size);
-        shadow.write(at, bytes);
-        // The backend is only handed whole blocks: a write that ends inside a block is
-        // completed with zeros, so the file always ends on a block boundary.
-        // The last block is padded on its way to the disk, but the file ends where its data ends.
+        shadow.write(at, use_odirect ? block_padded(bytes) : bytes);
         CHECK(object->size() == shadow.bytes().size());
       }
     }
@@ -634,148 +647,96 @@ TEST_CASE("uring host_write round-trips aligned and unaligned ranges", "[io][uri
   auto const expected = shadow.bytes();
   CHECK((path.contents() == expected));
   CHECK((read_back(ctx.get(), path.str()) == expected));
-  // Partial blocks are completed by the front end only for a backend that writes with O_DIRECT.
+  // Only a backend that writes with O_DIRECT has its last blocks completed by the front end.
   CHECK(ctx->write_alignment_requirement() == (use_odirect ? std::size_t{4096} : std::size_t{1}));
-  auto const stats = ctx->write_edge_stats();
-  CHECK((stats.merged_from_memory + stats.read_from_file + stats.zero_filled != 0) == use_odirect);
+  CHECK((ctx->write_edge_stats().padded_blocks != 0) == use_odirect);
 }
 
-// Writes that do not cover whole blocks never reach the backend as such: the front end completes
-// the first and last block and writes them whole. A file written front to back needs no read for
-// that (the unfinished last block is remembered); anything else is completed from the file.
-TEST_CASE("uring unaligned writes are completed to whole blocks by the front end",
+// A request is judged as a whole: its slices need not be aligned as long as together they fill
+// whole blocks from a block boundary on. A block that takes its bytes from two slices is assembled
+// by the front end and written with the rest, in the same request; nothing goes through the page
+// cache and nothing is read back.
+TEST_CASE("uring a request of unaligned slices is written as whole blocks",
+          "[io][uring][write][alignment]")
+{
+  write_context ctx{2};
+  cuda_stream stream;
+  scratch_path path;
+  auto object = ctx->open_io_object_for_write(path.str());
+
+  // A file as a spill writes it: a host header, then payloads packed one after the other, some
+  // on the device and some on the host. No boundary but the first is on a block.
+  std::vector<std::size_t> const sizes{2980, 37504, 1, 5000, 2 * MiB + 13, 640};
+  std::vector<std::vector<std::uint8_t>> data;
+  std::vector<std::unique_ptr<host_bytes>> host_sources;
+  std::vector<std::unique_ptr<device_bytes>> device_sources;
+  std::vector<write_slice> host_slices;
+  std::vector<write_slice> device_slices;
+  shadow_file shadow;
+  std::size_t at = 0;
+  for (std::size_t i = 0; i < sizes.size(); ++i) {
+    data.push_back(pattern(sizes[i], 300 + i));
+    if (i % 2 == 0) {
+      host_sources.push_back(std::make_unique<host_bytes>(data.back(), i == 0 ? 0U : 8U));
+      host_slices.emplace_back(at, sizes[i], host_sources.back()->get());
+    } else {
+      device_sources.push_back(std::make_unique<device_bytes>(data.back()));
+      device_slices.emplace_back(at, sizes[i], device_sources.back()->get());
+    }
+    shadow.write(at, data.back());
+    at += sizes[i];
+  }
+  auto const before = ctx->write_edge_stats();
+  CHECK(ctx->mixed_writev_async(*object, host_slices, device_slices, stream.ref()).get() == at);
+  auto const after = ctx->write_edge_stats();
+  CHECK(after.gathered_blocks > before.gathered_blocks);
+  CHECK(after.padded_blocks == before.padded_blocks + 1);
+
+  // The file is the data followed by the zeros that complete its last block.
+  auto const expected = block_padded(shadow.bytes());
+  CHECK(object->size() == expected.size());
+  CHECK(std::filesystem::file_size(path.str()) == expected.size());
+  CHECK((path.contents() == expected));                   // through the page cache
+  CHECK((read_back(ctx.get(), path.str()) == expected));  // through the backend
+}
+
+TEST_CASE("uring an O_DIRECT request that does not fill its blocks is rejected",
           "[io][uring][write][alignment]")
 {
   write_context ctx{2};
   scratch_path path;
-  auto object = ctx->open_io_object_for_write(path.str());
-  shadow_file shadow;
-  auto const before = ctx->write_edge_stats();
+  auto object         = ctx->open_io_object_for_write(path.str());
+  auto const data     = pattern(32768, 61);
+  auto const rejected = [&](std::vector<write_slice> const& slices) {
+    return is_invalid_argument(failure_of(ctx->host_writev_async(*object, slices)));
+  };
 
-  // Front to back, starting at a block boundary, in ragged pieces: one write per call, half of
-  // them synchronous and half asynchronous.
-  std::size_t at   = 0;
-  std::size_t seed = 100;
-  for (std::size_t const size : {std::size_t{3000},
-                                 std::size_t{12000},
-                                 std::size_t{37504},
-                                 std::size_t{1},
-                                 2 * MiB + 13,
-                                 std::size_t{4096},
-                                 std::size_t{640}}) {
-    auto const bytes = pattern(size, ++seed);
-    if (seed % 2 == 0) {
-      CHECK(ctx->host_write(*object, at, size, bytes.data()) == size);
-    } else {
-      CHECK(ctx->host_write_async(*object, at, size, bytes.data()).get() == size);
-    }
-    shadow.write(at, bytes);
-    at += size;
-  }
-  auto const sequential = ctx->write_edge_stats();
-  CHECK(sequential.read_from_file == before.read_from_file);
-  CHECK(sequential.merged_from_memory > before.merged_from_memory);
+  // It must start on a block boundary: the bytes in front of it are never made up.
+  CHECK_THROWS_AS(ctx->host_write(*object, 100, 50, data.data()), std::invalid_argument);
+  CHECK(rejected({{4097, 4095, data.data()}}));
+  // A block is written from its first byte on, without holes.
+  CHECK(rejected({{0, 1000, data.data()}, {2000, 2096, data.data()}}));
+  CHECK(rejected({{0, 4096, data.data()}, {8192 + 1, 4095, data.data()}}));
+  // Nothing was written by any of them.
+  CHECK(std::filesystem::file_size(path.str()) == 0);
+  CHECK(object->size() == 0);
 
-  // Not front to back: a few bytes in the middle of what is already written. The block is not
-  // the remembered one, so it is completed from the file.
-  auto const patch = pattern(777, ++seed);
-  CHECK(ctx->host_write(*object, 20000, patch.size(), patch.data()) == patch.size());
-  shadow.write(20000, patch);
-  CHECK(ctx->write_edge_stats().read_from_file > sequential.read_from_file);
+  // Whole blocks may be skipped, and a slice may stop inside a block where the file has no data:
+  // the layout of buffers that each start on a block boundary.
+  CHECK(
+    ctx->host_writev_async(*object, {{{0, 5000, data.data()}, {16384, 600, data.data()}}}).get() ==
+    5600);
+  CHECK(std::filesystem::file_size(path.str()) == 16384 + 4096);
 
-  auto const expected = shadow.bytes();
-  // The padding of the last block is cut off again: the file is as long as its data.
-  CHECK(object->size() == expected.size());
-  CHECK(std::filesystem::file_size(path.str()) == expected.size());
-  // Read through the page cache and through the backend: both see the same, complete file.
-  CHECK(path.contents() == expected);
-  CHECK(read_back(ctx.get(), path.str()) == expected);
-}
-
-// The bytes in front of a request are never invented. A request that starts inside a block must
-// start inside the file's data or exactly at its end; anywhere else it fails before it writes.
-TEST_CASE(
-  "uring an O_DIRECT write that starts inside a block needs the file's bytes in front of it",
-  "[io][uring][write][alignment]")
-{
-  write_context ctx{2};
-  scratch_path path;
-  auto const data = pattern(20000, 61);
-
-  SECTION("the first write to a new file must start on a block boundary")
-  {
-    auto object = ctx->open_io_object_for_write(path.str());
-    CHECK_THROWS_AS(ctx->host_write(*object, 100, 50, data.data()), std::invalid_argument);
-    CHECK(is_invalid_argument(failure_of(ctx->host_write_async(*object, 4097, 50, data.data()))));
-    CHECK(std::filesystem::file_size(path.str()) == 0);  // nothing was written, nothing padded
-    CHECK(object->size() == 0);
-    // From a block boundary it is fine, whatever the length.
-    CHECK(ctx->host_write(*object, 0, 100, data.data()) == 100);
-    CHECK(std::filesystem::file_size(path.str()) == 100);
-  }
-
-  SECTION("past the end of the data it fails, also in a block the file already has")
-  {
-    auto object = ctx->open_io_object_for_write(path.str());
-    REQUIRE(ctx->host_write(*object, 0, 1000, data.data()) == 1000);
-    // Bytes 1000..3000 do not exist: a write at 3000 would have to make them up.
-    CHECK_THROWS_AS(ctx->host_write(*object, 3000, 50, data.data()), std::invalid_argument);
-    CHECK_THROWS_AS(ctx->host_write(*object, 8192 + 7, 50, data.data()), std::invalid_argument);
-    CHECK(std::filesystem::file_size(path.str()) == 1000);
-    CHECK((path.contents() == std::vector<std::uint8_t>(data.begin(), data.begin() + 1000)));
-    // A block boundary past the end is a hole followed by data, as always.
-    CHECK(ctx->host_write(*object, 8192, 50, data.data()) == 50);
-    CHECK(std::filesystem::file_size(path.str()) == 8192 + 50);
-  }
-
-  SECTION("a reopened file continues where its data ends, and its middle can be rewritten")
-  {
-    shadow_file shadow;
-    {
-      auto object = ctx->open_io_object_for_write(path.str());
-      REQUIRE(ctx->host_write(*object, 0, 5000, data.data()) == 5000);
-      shadow.write(0, std::span{data.data(), 5000});
-    }
-    REQUIRE(std::filesystem::file_size(path.str()) == 5000);
-    auto const before = ctx->write_edge_stats();
-    auto object = ctx->open_io_object_for_write(path.str(), {.mode = write_mode::open_existing});
-    // Nothing is remembered for this object: the block in front comes from the file.
-    auto const more = pattern(7000, 62);
-    CHECK(ctx->host_write_async(*object, 5000, more.size(), more.data()).get() == more.size());
-    shadow.write(5000, more);
-    CHECK(ctx->write_edge_stats().read_from_file == before.read_from_file + 1);
-    // The middle of the file: the rest of both blocks is read back, not replaced.
-    auto const patch = pattern(300, 63);
-    CHECK(ctx->host_write(*object, 4000, patch.size(), patch.data()) == patch.size());
-    shadow.write(4000, patch);
-    CHECK(object->size() == shadow.bytes().size());
-    CHECK(std::filesystem::file_size(path.str()) == shadow.bytes().size());
-    CHECK((path.contents() == shadow.bytes()));
-    CHECK((read_back(ctx.get(), path.str()) == shadow.bytes()));
-  }
-
-  SECTION("bytes another writer left in the block are kept")
-  {
-    auto object = ctx->open_io_object_for_write(path.str());
-    REQUIRE(ctx->host_write(*object, 0, 1000, data.data()) == 1000);
-    // Behind this object's back the file grows (another object, or a write that failed
-    // part-way): the object's own view still ends at 1000.
-    auto const foreign = pattern(2000, 64);
-    {
-      std::ofstream out(path.str(), std::ios::binary | std::ios::in | std::ios::out);
-      out.seekp(1000);
-      out.write(reinterpret_cast<char const*>(foreign.data()),
-                static_cast<std::streamsize>(foreign.size()));
-    }
-    shadow_file shadow;
-    shadow.write(0, std::span{data.data(), 1000});
-    shadow.write(1000, foreign);
-    // Continue where the file now ends: the block is read back, the remembered copy is not used.
-    auto const more = pattern(500, 65);
-    CHECK(ctx->host_write(*object, 3000, more.size(), more.data()) == more.size());
-    shadow.write(3000, more);
-    CHECK((path.contents() == shadow.bytes()));
-  }
+  // Ending inside a block is only possible at the end of the file: the zeros that complete the
+  // block would replace data.
+  CHECK_THROWS_AS(ctx->host_write(*object, 0, 1000, data.data()), std::invalid_argument);
+  CHECK(rejected({{8192, 100, data.data()}}));
+  CHECK(std::filesystem::file_size(path.str()) == 16384 + 4096);
+  // Whole blocks can be rewritten anywhere, and the file can grow from its end.
+  CHECK(ctx->host_write(*object, 4096, 8192, data.data()) == 8192);
+  CHECK(ctx->host_write(*object, 16384 + 4096, 100, data.data()) == 100);
+  CHECK(std::filesystem::file_size(path.str()) == 16384 + 8192);
 }
 
 TEST_CASE("uring asynchronous host and device writes round-trip", "[io][uring][write]")
@@ -795,9 +756,9 @@ TEST_CASE("uring asynchronous host and device writes round-trip", "[io][uring][w
       auto const device_data = pattern(size, ++seed);
       host_bytes host{host_data, offset % 2 == 0 ? std::size_t{0} : std::size_t{8}};
       device_bytes device{device_data};
-      // With O_DIRECT a request starts on a block boundary or inside the file's data; the
-      // sizes stay ragged.
-      auto const host_at   = offset / 4096 * 4096 + (seed % 3) * 64 * MiB;
+      // With O_DIRECT a request starts on a block boundary and may end inside a block only at
+      // the end of the file, so the two requests grow the file; the sizes stay ragged.
+      auto const host_at   = (shadow.bytes().size() + offset + 4095) / 4096 * 4096;
       auto const device_at = (host_at + size + 8191) / 4096 * 4096;
 
       auto host_future = ctx->host_write_async(*object, host_at, size, host.get());
@@ -805,8 +766,8 @@ TEST_CASE("uring asynchronous host and device writes round-trip", "[io][uring][w
         ctx->device_write_async(*object, device_at, size, device.get(), stream.ref());
       CHECK(std::move(host_future).get() == size);
       CHECK(std::move(device_future).get() == size);
-      shadow.write(host_at, host_data);
-      shadow.write(device_at, device_data);
+      shadow.write(host_at, block_padded(host_data));
+      shadow.write(device_at, block_padded(device_data));
       CHECK(object->size() == shadow.bytes().size());
     }
   }
@@ -831,7 +792,7 @@ TEST_CASE("uring device write observes the work queued on its stream", "[io][uri
   CHECK(ctx->device_write_async(*object, 0, bytes, device.get(), stream.ref()).get() == bytes);
 
   auto const contents = path.contents();
-  REQUIRE(contents.size() == bytes);
+  REQUIRE(contents.size() == (bytes + 4095) / 4096 * 4096);
   CHECK(std::all_of(contents.begin(),
                     contents.begin() + static_cast<std::ptrdiff_t>(bytes),
                     [](std::uint8_t b) { return b == 0xAB; }));
@@ -864,7 +825,7 @@ TEST_CASE("uring device writes order after the caller's default streams", "[io][
           .get() == bytes);
 
   auto const contents = path.contents();
-  REQUIRE(contents.size() == bytes);
+  REQUIRE(contents.size() == (bytes + 4095) / 4096 * 4096);
   CHECK(std::all_of(contents.begin(),
                     contents.begin() + static_cast<std::ptrdiff_t>(bytes),
                     [](std::uint8_t b) { return b == 0xAB; }));
@@ -946,8 +907,9 @@ TEST_CASE("uring vectored writes place every segment", "[io][uring][write]")
     CHECK(ctx->device_writev_async(*object, slices, stream.ref()).get() == 0);
   }
 
-  CHECK(object->size() == shadow.bytes().size());
-  CHECK((read_back(ctx.get(), path.str()) == shadow.bytes()));
+  // Slices that stop inside a block are completed with zeros, the last one included.
+  CHECK(object->size() == block_padded(shadow.bytes()).size());
+  CHECK((read_back(ctx.get(), path.str()) == block_padded(shadow.bytes())));
 }
 
 TEST_CASE("uring writes past EOF extend the file and leave holes", "[io][uring][write]")
@@ -960,17 +922,18 @@ TEST_CASE("uring writes past EOF extend the file and leave holes", "[io][uring][
 
   auto const tail = pattern(10, 4);
   CHECK(ctx->host_write_async(*object, MiB, tail.size(), tail.data()).get() == tail.size());
-  CHECK(object->size() == MiB + 10);
+  // The block the write ends in is completed with zeros.
+  CHECK(object->size() == MiB + 4096);
 
   // Reads through the writable object clamp to the grown size.
   std::vector<std::uint8_t> through(MiB + 100, 0xFF);
-  CHECK(ctx->host_read_async_io(*object, 0, through.size(), through.data()).get() == MiB + 10);
+  CHECK(ctx->host_read_async_io(*object, 0, through.size(), through.data()).get() == MiB + 100);
   CHECK(std::equal(tail.begin(), tail.end(), through.begin() + MiB));
   CHECK(std::all_of(
     through.begin() + 1000, through.begin() + MiB, [](std::uint8_t b) { return b == 0; }));
 
   auto const contents = read_back(ctx.get(), path.str());
-  REQUIRE(contents.size() == MiB + 10);
+  REQUIRE(contents.size() == MiB + 4096);
   CHECK(std::all_of(
     contents.begin() + 1000, contents.begin() + MiB, [](std::uint8_t b) { return b == 0; }));
 }
@@ -1087,7 +1050,7 @@ TEST_CASE("uring flush makes completed writes durable", "[io][uring][write]")
   CHECK_NOTHROW(ctx->flush(*object));
   CHECK_NOTHROW(ctx->flush_async(*object).get());
   CHECK_NOTHROW(ctx->flush_async(*object, io_priority::low).get());
-  CHECK((path.contents() == bytes));
+  CHECK((path.contents() == block_padded(bytes)));
 }
 
 TEST_CASE("uring low-priority writes complete", "[io][uring][write]")
@@ -1268,7 +1231,8 @@ TEST_CASE("uring aligned writes bypass the page cache", "[io][uring][write]")
         body + 100);
 
   auto const file_bytes = object->size();
-  REQUIRE(file_bytes == 2 * body + 100);
+  // The last block is completed with zeros and written like every other block.
+  REQUIRE(file_bytes == 2 * body + 4096);
   auto const page  = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
   auto const pages = (file_bytes + page - 1) / page;
   int const fd     = ::open(path.str().c_str(), O_RDONLY);
@@ -1489,7 +1453,7 @@ TEST_CASE("uring writes and truncating opens invalidate the path's metadata", "[
   {
     auto writer = ctx->open_io_object_for_write(path.str(), {.mode = write_mode::open_existing});
     CHECK(store.has_path(path.str()));
-    auto const bytes = pattern(100, 41);
+    auto const bytes = pattern(4096, 41);  // a whole block: the file already has data behind it
     CHECK(ctx->host_write_async(*writer, 0, bytes.size(), bytes.data()).get() == bytes.size());
     CHECK_FALSE(store.has_path(path.str()));
   }

@@ -617,30 +617,25 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   // is above 1 exactly then. Any other backend gets every write as the caller
   // made it.
   //
-  // O_DIRECT writes whole blocks, so such a backend is never handed less: the
-  // front end completes the first and the last block of a request that is not
-  // block aligned and writes them whole, and no part of a file goes through the
-  // page cache while the rest is written directly (mixing the two can leave
-  // stale pages in the page cache). The rules:
+  // O_DIRECT writes whole blocks, each from one piece of memory, and writing
+  // the rest of a file through the page cache instead can leave stale pages
+  // there. So such a backend is handed whole blocks only, and a request is
+  // judged as a whole, not slice by slice:
   //
-  //  - A request that starts inside a block must start inside the file's data
-  //    or exactly at its end, so that the bytes in front of it in that block
-  //    are the file's. They are taken from the block this object remembers
-  //    (when the request continues exactly where the object left the file and
-  //    the file still ends there) or read back from the file: a reopened file
-  //    and the middle of a file both work. Bytes in front of a request are
-  //    never invented: a request that starts inside a block past the end of
-  //    the data fails with std::invalid_argument before anything is written.
-  //  - Zeros fill only what lies behind the request's first byte and past the
-  //    end of the file: a gap inside the request and the rest of its last
-  //    block. That padding is cut off again when the request is over
-  //    (io_object::resize), so the size of the file is the size of its data.
-  //  - A file is written through one object at a time. Bytes another writer
-  //    puts into a block this object is completing can be lost, as with any
-  //    O_DIRECT read-modify-write.
+  //  1. Every block the request touches must be written from its first byte
+  //     on, without holes. In particular the request starts on a block
+  //     boundary: the bytes in front of it are never made up.
+  //  2. Its slices need not be aligned. A block that takes its bytes from more
+  //     than one slice (a header followed by payloads, say) is assembled in
+  //     host memory and written with the rest, in the same request.
+  //  3. The request may stop before the end of a block (the end of a buffer,
+  //     the end of the file) only where the file has no data: the rest of the
+  //     block is zeros, and the file ends on a block boundary.
+  //  4. Anything else fails with std::invalid_argument before anything is
+  //     written.
   //
-  // The partial blocks are written on the calling thread before the rest of the
-  // request is dispatched.
+  // Nothing is read from the file, nothing is kept between requests, and no
+  // lock is taken. The caller records how long its data is.
 
  public:
   /// The unit a write must start on and cover whole multiples of for the backend
@@ -648,35 +643,15 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// 1 (the default) means writes have no alignment requirement.
   [[nodiscard]] virtual std::size_t write_alignment_requirement() const noexcept { return 1; }
 
-  /// Per-object state of the unaligned writes (io_context.cpp).
-  struct write_edge_object;
-
  private:
-  /// Host bytes of a write that share a block with other bytes.
-  struct write_edge_piece {
-    std::size_t offset;
-    std::size_t size;
-    const std::uint8_t* src;
-  };
-
-  /// Completes and writes the blocks @p pieces fall in, on the calling thread.
-  /// [@p request_begin, @p request_end) spans the whole request. On return the
-  /// caller owes one finish of the unaligned request (see io_context.cpp).
-  void write_edge_blocks(const io_object& obj,
-                         write_edge_object& state,
-                         std::vector<write_edge_piece>& pieces,
-                         std::size_t request_begin,
-                         std::size_t request_end);
-
   struct write_edge_state;
   std::unique_ptr<write_edge_state> _write_edges;
 
  public:
-  /// How the partial blocks of unaligned writes were completed so far.
+  /// What the front end did for requests that were not block aligned.
   struct write_edge_counters {
-    std::uint64_t merged_from_memory{0};  ///< continued the remembered last block
-    std::uint64_t read_from_file{0};      ///< the block had to be read back
-    std::uint64_t zero_filled{0};         ///< a new block past the end of the file
+    std::uint64_t gathered_blocks{0};  ///< blocks assembled from the ends of slices
+    std::uint64_t padded_blocks{0};    ///< of those, last blocks completed with zeros
   };
   [[nodiscard]] write_edge_counters write_edge_stats() const noexcept;
 };
